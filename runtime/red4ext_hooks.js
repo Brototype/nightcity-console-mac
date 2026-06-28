@@ -553,6 +553,7 @@ rpc.exports = {
 // ============================================================================
 (function () {
     const OUT='/tmp/cp2077_out.txt', CMD='/tmp/cp2077_cmd.txt';
+    const LREQ='/tmp/cp2077_lreq.txt', LRES='/tmp/cp2077_lres.txt';   // Q7 Lua Game.* call bridge (request/response)
     function log(s){ try{const f=new File(OUT,'a');f.write(s+'\n');f.flush();f.close();}catch(e){} try{console.log('[MINICET] '+s);}catch(e2){} }
     function readFile(p){ try{return File.readAllText(p);}catch(e){return null;} }
     function clearFile(p){ try{const f=new File(p,'w');f.write('');f.close();}catch(e){} }
@@ -571,7 +572,7 @@ rpc.exports = {
         function ensureReg(){ if(reg) return; reg=new NativeFunction(base.add(0x2188e8c),'pointer',[])(); const rv=reg.readPointer();
             GetClass=new NativeFunction(rv.add(0x10).readPointer(),'pointer',['pointer','uint64']);
             GetEnum =new NativeFunction(rv.add(0x18).readPointer(),'pointer',['pointer','uint64']); }
-        let player=null, playerVt=null, fromtd=null, depth=0, busy=false, lastCmd=''; const pendingQ=[];
+        let player=null, playerVt=null, fromtd=null, depth=0, busy=false, lastCmd='', lastLReq=''; const pendingQ=[];
         const playerCands=[], playerCandSet=new Set(); let devOwner=null;  // cached dev-data owner (the local player)
         function addCand(ctx){ const k=ctx.toString(); if(playerCandSet.has(k)) return; playerCandSet.add(k); playerCands.push(ctx); if(playerCands.length>8){ const old=playerCands.shift(); playerCandSet.delete(old.toString()); } }
         const instReg={}, seenVt=new Set(); let nameHookInstalled=false;
@@ -997,7 +998,19 @@ rpc.exports = {
             m=line.match(/^Game\.AddToInventory\(\s*['"]([A-Za-z0-9_.]+)['"]\s*(?:,\s*([0-9]+))?\s*\)\s*;?\s*$/);
             if(m) return 'give '+m[1]+' '+(m[2]||'1');
             return null; }
+        function luaRespond(seq, type, val){ try{ var f=new File(LRES,'w'); f.write(seq+'\t'+type+'\t'+val+'\n'); f.flush(); f.close(); }catch(e){} }
+        // Runs on the Frida poller thread (NOT via pendingQ) so it never deadlocks against the overlay's
+        // render-thread block. It must therefore do only thread-safe reads (no executor/game-fn calls):
+        // GetPlayer returns the cached `player` handle. Methods needing a real call wait for Q8 dispatch.
+        function handleLuaCall(raw){   // raw = "lua-call \t seq \t method \t nargs \t arg1 \t ..."
+            const p=raw.split('\t'); const seq=p[1], method=p[2];
+            try{
+                if(method==='GetPlayer'||method==='GetPlayerControlledGameObject'){ if(player&&!player.isNull()) luaRespond(seq,'ptr','0x'+player.toString(16)); else luaRespond(seq,'nil',''); return; }
+                luaRespond(seq,'err','Game.'+method+'() needs main-thread dispatch (wired in Q8+); Q7 proves the bridge via GetPlayer');
+            }catch(e){ luaRespond(seq,'err',''+e); }
+        }
         function execute(line){ let raw=line.trim();
+            if(raw.indexOf('lua-call\t')===0){ handleLuaCall(raw); return; }   // Q7 bridge: handle before the generic whitespace split
             const ct=cetTranslate(raw); if(ct){ log('(cet) '+raw+'  ->  '+ct); raw=ct; }
             const t=raw.split(/\s+/);
             if(t[0]==='metalrecon'){ metalRecon(); return; }   // Phase-2 recon: works at menu too
@@ -1071,8 +1084,12 @@ rpc.exports = {
                 const inst=instReg[m.sub(base).add(FV0).toString(16)]; log('findinst '+t[1]+' -> '+(inst?inst:'NONE captured')); return; }
             log('unknown: '+line); }
         setInterval(function(){ try{ const c=readFile(CMD); const s=(c||'').trim();
-            if(!s){ lastCmd=''; return; }                 // file empty -> re-arm so an identical next command fires again
-            if(s!==lastCmd){ lastCmd=s; const cmd=s.replace(/^\d+\t/,''); pendingQ.push(cmd); clearFile(CMD); log('queued: '+cmd); } }catch(e){} }, 120);
+            if(!s){ lastCmd=''; }                          // file empty -> re-arm so an identical next command fires again
+            else if(s!==lastCmd){ lastCmd=s; const cmd=s.replace(/^\d+\t/,''); pendingQ.push(cmd); clearFile(CMD); log('queued: '+cmd); }
+            // Q7: Lua Game.* call bridge - a separate synchronous channel (lreq -> lres), queued like a command
+            const lq=readFile(LREQ); const ls=(lq||'').trim();
+            if(!ls){ lastLReq=''; }
+            else if(ls!==lastLReq){ lastLReq=ls; handleLuaCall('lua-call\t'+ls); clearFile(LREQ); } }catch(e){} }, 120);
         // Clean shutdown: the game's static-destructor teardown segfaults with hooks attached (cosmetic,
         // happens AFTER the game has saved + quit). Route exit() -> _exit() to skip that teardown so the
         // process exits cleanly (no macOS crash dialog, exit code 0).
@@ -1573,6 +1590,244 @@ try { cmnLog('=== cybermodman custom-names init ==='); cmnLoad(); cmnInstall(); 
             mlog('LoadArchives args-probe attached @ ' + base.add(0x3edaae8) + ' (0x3edaae8)');
         } catch (e) { mlog('LoadArchives probe err: ' + e); }
     } catch (e) { mlog('install FAILED: ' + e); }
+})();
+
+// ===========================================================================
+// installFactoryIndex (Q-clothing): inject ArchiveXL custom factory CSVs into
+// the engine factory index via FRIDA (ArchiveXL's own HookAfter is dead on macOS).
+// Bring-up build: read-only instrumentation (markers, JS<->engine hash xcheck,
+// CreateEntryMap job-data dump, depot probe) + a try/catch'd piggyback inject.
+// Renders LITERAL-appearance items only; '!'-dynamic appearances need a
+// DynamicAppearance port next. Addresses are file-offsets; runtime = base+off.
+// ===========================================================================
+(function installFactoryIndex(){
+    // M1b: DISABLED. ArchiveXL's native FactoryIndexExtension now owns the LoadFactoryAsync (0xcc0710)
+    // hook via the gum-backed RED4ext Attach. Running this IIFE too would double-patch the same prologue
+    // with a second gum instance. installFactoryReseal (0xcc0bec) below STAYS active for the +0x68 race.
+    return;
+    var base; try { base = getModuleBase(); } catch (e) { base = null; }
+    if (!base) return;
+    var LOG = '/tmp/cp2077_factoryindex.log';
+    function flog(s){ try{ var f=new File(LOG,'a'); f.write(s+'\n'); f.flush(); f.close(); }catch(e){} try{ console.log('[FACTORYIDX] '+s); }catch(e){} }
+    try { var f0=new File(LOG,'w'); f0.write('=== installFactoryIndex bring-up ===\n'); f0.close(); } catch(e){}
+
+    // engine-exact ResourcePath hash: FNV1a64 over a sanitized path (strip one leading quote, strip a leading
+    // separator run, collapse separator runs to a single '\\', '/'->'\\', ASCII-lowercase, 199-char cap, SIGNED bytes).
+    function fnv1a64(s){ var h=BigInt('0xCBF29CE484222325'), P=BigInt('0x100000001b3'), M=(BigInt(1)<<BigInt(64))-BigInt(1);
+        for(var i=0;i<s.length;i++){ var b=s.charCodeAt(i)&0xff; if(b>=0x80)b-=256; h^=(BigInt(b)&M); h=(h*P)&M; } return h; }
+    function sanitize(p){ if(!p) return ''; var MAX=199,o='',i=0;
+        if(p[0]==='"'||p[0]==="'") i++;
+        while(i<p.length && (p[i]==='/'||p[i]==='\\')) i++;
+        while(i<p.length && p[i]!=='"' && p[i]!=="'"){ var c=p[i];
+            if(c==='/'||c==='\\'){ o+='\\'; i++; while(i<p.length && (p[i]==='/'||p[i]==='\\')) i++; }
+            else { o+=(c>='A'&&c<='Z')?c.toLowerCase():c; i++; }
+            if(o.length===MAX) break; }
+        return o; }
+    function pathHashHex(p){ var s=sanitize(p); return s.length ? fnv1a64(s).toString(16) : null; }
+
+    var MARK_VEH = pathHashHex('base\\gameplay\\factories\\vehicles\\vehicles.csv');
+    var MARK_MAS = pathHashHex('base\\gameplay\\factories.csv');
+    flog('markers: vehicles=0x'+MARK_VEH+' master=0x'+MARK_MAS+' (expect f94faab4ff97393a / 6c13dcf96a5bfef4)');
+    var MARK_VEH_P = ptr('0x'+MARK_VEH), MARK_MAS_P = ptr('0x'+MARK_MAS);
+
+    // custom factory CSV paths (the Mods tab writes these, one per line; here read from /tmp for bring-up)
+    var customs=[];
+    try { var t=File.readAllText('/tmp/cp2077_xl_factories.txt'); if(t){ t.split('\n').forEach(function(line){ line=line.trim(); if(!line) return;
+        var h=pathHashHex(line); if(!h) return; customs.push({ path:line, hash:h, p:ptr('0x'+h) }); }); } } catch(e){ flog('read xl list err '+e); }
+    flog('collected '+customs.length+' custom factory path(s)');
+    customs.forEach(function(c){ flog('  custom "'+c.path+'" -> 0x'+c.hash); });
+
+    var fnLoad=null, fnRP=null, fnDepot=null;
+    try { fnLoad  = new NativeFunction(base.add(0xcc0710), 'void',    ['pointer','uint64','pointer']); } catch(e){ flog('fnLoad ctor err '+e); }
+    try { fnRP    = new NativeFunction(base.add(0x21c90a4),'uint64',  ['pointer','uint32']); } catch(e){ flog('fnRP ctor err '+e); }
+    try { fnDepot = new NativeFunction(base.add(0x21c4d44),'pointer', ['uint64']); } catch(e){ flog('fnDepot ctor err '+e); }
+
+    // cross-check our JS hash against the engine's own ResourcePath::Create (a MISMATCH = stop, sanitize is wrong)
+    if (fnRP) customs.forEach(function(c){ try{ var cs=Memory.allocUtf8String(c.path); var eng=fnRP(cs, c.path.length);
+        flog('  XCHECK "'+c.path+'" js=0x'+c.hash+' eng=0x'+eng.toString(16)+(eng.toString(16)===c.hash?' OK':' *** MISMATCH ***')); }catch(e){ flog('  XCHECK err '+e); } });
+
+    // step C: read-only dump of the engine's OWN CreateEntryMap job-data (so the own-batch seal can be built right later)
+    var dumpedMap=false;
+    try { Interceptor.attach(base.add(0xcc1434), { onEnter:function(args){ if(dumpedMap) return; dumpedMap=true;
+        try{ flog('CreateEntryMap jobData='+args[0]+'\n'+hexdump(args[0],{length:0x48,header:false})); }catch(e){ flog('map dump err '+e); } } });
+        flog('installed CreateEntryMap probe @ '+base.add(0xcc1434)); } catch(e){ flog('attach map err '+e); }
+
+    // hook LoadFactoryAsync: log the factory pass + piggyback-inject customs on the marker row (try/catch'd = Frida-safe)
+    var injected=false, sawVeh=false, nLFA=0;
+    try { Interceptor.attach(base.add(0xcc0710), { onEnter:function(args){ try{
+        var aIndex=args[0], aPath=args[1], aCtx=args[2]; nLFA++;
+        if(nLFA<=48) flog('LFA #'+nLFA+' aPath='+aPath+' aIndex='+aIndex+' aCtx='+aCtx);
+        var isVeh=aPath.equals(MARK_VEH_P), isMas=aPath.equals(MARK_MAS_P);
+        if(isVeh) sawVeh=true;
+        if((isVeh || (isMas && !sawVeh)) && !injected){ injected=true;
+            flog('=== marker hit ('+(isVeh?'vehicles':'master')+') -> piggyback inject '+customs.length+' (aIndex='+aIndex+' aCtx='+aCtx+') ===');
+            customs.forEach(function(c){
+                try{ if(fnDepot){ var dh=fnDepot(uint64('0x'+c.hash)); flog('  depot "'+c.path+'" -> '+(dh.isNull()?'ABSENT (archive/CSV not loaded)':dh)); } }catch(e){ flog('  depot probe err '+e); }
+                try{ fnLoad(aIndex, uint64('0x'+c.hash), aCtx); flog('  LoadFactoryAsync ok 0x'+c.hash); }catch(e){ flog('  LoadFactoryAsync FAIL "'+c.path+'": '+e); } });
+        }
+    }catch(e){ flog('LFA onEnter err '+e); } } });
+    flog('installed LoadFactoryAsync hook @ '+base.add(0xcc0710)); } catch(e){ flog('attach LFA err '+e); }
+})();
+
+// installFactoryReseal (THE FIX): our injected ArchiveXL factory rows land in the raw row array
+// (factory+0xa0) but the engine's one-shot CreateEntryMap already sealed the queryable HashMap
+// (factory+0x68) before our async LoadFactoryAsync appended them -> the equip-time query
+// FUN_100cc0bec(factory, entityNameCName) returns 0 -> entity never loads -> invisible. Fix: hook
+// that query; when OUR entityName is asked for but missing from +0x68, find our row in +0xa0 and
+// insert it (CreateEntryMap's own per-row inserter FUN_10096c938) BEFORE the original body runs, so
+// the first equip resolves. Operates on x0 = the exact factory the equip path uses (fixes both
+// seal-ordering and wrong-instance modes). Addresses Ghidra-verified on Steam 2.3.1 arm64.
+// THE FIX is a RETURN-OVERRIDE: our injected factory rows never landed in the LIVE equip factory's
+// +0x68 index (async CreateEntryMap sealed before our async ParseFile appended; the equip factory ptr
+// also differs from the boot aIndex). The engine's equip-time resolver FUN_100cc0bec(factory, CName)
+// (file off 0xcc0bec) returns the _root.ent ResourcePath = **(rowPtr+0x18), or 0 if the CName isn't
+// indexed. Ghidra-proven (workflow wf_d4f7a8f6): the entityName query's result is dead, but the SECOND
+// (appearance) query through this SAME function drives the appearance-resource load (req+0x58/req+0x60);
+// our item's entityName == appearanceName == "melgardens_swim_string_top_", so both calls use the same
+// CName. So: when FUN_100cc0bec is asked for one of our CNames and returns 0 (not in the live index),
+// replace the return with our _root.ent ResourcePath -> the engine loads the entity -> builds the garment.
+// Both melgardens top_ and bottom_ map to the SAME _root.ent (melgardens_swim_string_root.ent).
+(function installFactoryReseal(){
+    var LOG='/tmp/cp2077_factoryindex.log';
+    function rlog(s){ try{ var f=new File(LOG,'a'); f.write(s+'\n'); f.flush(); f.close(); }catch(e){} try{console.log('[FXRESEAL] '+s);}catch(e){} }
+    var base; try{base=getModuleBase();}catch(e){base=null;}
+    if(!base){ rlog('reseal: no base'); return; }
+    var ROOTENT = ptr('0xe1d11df4d38d1d94');   // base\melgardens\swim_string\paperwork\melgardens_swim_string_root.ent
+    var WANT={ '0xa5f426a776aa7ff':'melgardens_swim_string_top_', '0xc86606f3c24e7fe9':'melgardens_swim_string_bottom_' };
+    // ROBUST FIX: actually INSERT a synthesized row into the live equip factory's +0x68 (so EVERY
+    // consumer resolves, not just FUN_100cc0bec). Row {+0=CName, +0x18->token(_root.ent path)}; the
+    // engine's own per-row inserter FUN_10096c938(scratch, factory+0x68, rowPtr, &rowPtr) links it in.
+    // onLeave override remains as a belt-and-suspenders fallback.
+    var insert=null;
+    try{ insert=new NativeFunction(base.add(0x96c938),'void',['pointer','pointer','pointer','pointer']); }catch(e){ rlog('insert NF err '+e); }
+    var scratch=Memory.alloc(64), rows={};
+    Object.keys(WANT).forEach(function(cn){
+        var tok=Memory.alloc(8); tok.writeU64(uint64('0xe1d11df4d38d1d94'));
+        var row=Memory.alloc(0x20);
+        for(var i=0;i<0x20;i+=8) row.add(i).writeU64(uint64(0));
+        row.writeU64(uint64(cn)); row.add(0x18).writePointer(tok);
+        var rv=Memory.alloc(8); rv.writePointer(row);
+        rows[cn]={row:row, rv:rv};
+    });
+    var inserted={}, ovLog=0, missLog=0, missSeen={};
+    try{
+        Interceptor.attach(base.add(0xcc0bec), {
+            onEnter:function(a){ this.cn=a[1].toString(); this.fac=a[0];
+                try{ if(WANT[this.cn] && insert){ var k=this.fac.toString()+':'+this.cn; if(!inserted[k]){ inserted[k]=1; var rr=rows[this.cn]; insert(scratch, this.fac.add(0x68), rr.row, rr.rv); rlog('INSERT '+WANT[this.cn]+' row -> +0x68 of fac='+this.fac); } } }catch(e){ rlog('insert err '+e); }
+            },
+            onLeave:function(r){
+                try{
+                    if(WANT[this.cn]){
+                        if(r.isNull()){ r.replace(ROOTENT); if(ovLog<12){ ovLog++; rlog('OVERRIDE(fallback) cc0bec: '+WANT[this.cn]+' -> _root.ent'); } }
+                        else if(ovLog<12){ ovLog++; rlog('*** cc0bec '+WANT[this.cn]+' RESOLVED -> '+r+' (insert worked) ***'); }
+                    } else if(r.isNull() && missLog<40 && !missSeen[this.cn]){ missSeen[this.cn]=1; missLog++; rlog('  (cc0bec miss) x1='+this.cn); }
+                }catch(e){ rlog('override err '+e); }
+            }
+        });
+        rlog('factory insert+override hook @ base+0xcc0bec watch='+Object.keys(WANT).join(','));
+    }catch(e){ rlog('attach err '+e); }
+})();
+
+// installAppearanceProbe (Track A diagnostic): read-only probes to pinpoint WHERE custom-clothing
+// appearance resolution breaks. Hooks EntityTemplate::FindAppearance (does our literal appearance
+// resolve to a template entry?) + ScheduleAppearanceBuildingJobs (did the engine start building the
+// garment = appearance resolved end-to-end?). Filtered to our 3 watched CNames + a short calibration.
+(function installAppearanceProbe(){
+    var LOG='/tmp/cp2077_appearance.log';
+    function alog(s){ try{var f=new File(LOG,'a');f.write(s+'\n');f.flush();f.close();}catch(e){} try{console.log('[APPRPROBE] '+s);}catch(e){} }
+    try{var f0=new File(LOG,'w');f0.write('=== appearance probe (Track A) ===\n');f0.close();}catch(e){}
+    var base; try{base=getModuleBase();}catch(e){base=null;}
+    if(!base){ alog('no module base; abort'); return; }
+    // watched CNames (FNV1a64 of the raw string). NativePointer.toString() drops the leading zero.
+    var WATCH={ '0xa5f426a776aa7ff':'melgardens_swim_string_top_',
+                '0x4b5dd0abbc6fc1e4':'black',
+                '0xc86606f3c24e7fe9':'melgardens_swim_string_bottom_' };
+    // our entity's appearance-entry CNames (to recognize OUR _root.ent template when it's queried)
+    var OURS={ '0xa5f426a776aa7ff':1, '0xc86606f3c24e7fe9':1 };
+    var FORCE_TOP = ptr('0xa5f426a776aa7ff');   // our bare top appearance name (no &Female/&FPP suffix)
+    // cheap detector: ONLY scan small templates (our _root.ent has 2 entries; NPC/player templates have many),
+    // so this stays light even during city load. Returns entry hashes if this is OUR template, else null.
+    function templateIsOurs(tmpl){
+        try{
+            var sz=tmpl.add(0x5c).readU32();
+            if(sz===0 || sz>12) return null;                 // skip heavy templates entirely
+            var arr=tmpl.add(0x50).readPointer();
+            if(arr.isNull()) return null;
+            var hs=[], ours=false;
+            for(var i=0;i<sz;i++){ var nh=arr.add(i*0x18).readU64().toString(); hs.push(nh); if(OURS[nh]) ours=true; }
+            return ours ? hs : null;
+        }catch(e){ return null; }
+    }
+    var calib=0, ourSeen=0;
+    try{
+        Interceptor.attach(base.add(0xcb12bc), {
+            onEnter:function(a){ this.tmpl=a[0]; var h=a[1].toString(); this.h=h; this.w=WATCH[h];
+                if(this.w) alog('FindAppearance REQUEST name='+this.w+' ('+h+')');
+                else if(calib<6){ calib++; alog('  (calib) x1='+h); }
+                // FIX #2 + confirm: if this is OUR _root.ent template, log the searched name and FORCE the
+                // bare top appearance so a &Female/&FPP-suffixed search still resolves.
+                try{ var hs=templateIsOurs(this.tmpl);
+                    if(hs){ if(ourSeen<25){ ourSeen++; alog('*** OUR _root.ent QUERIED: searched='+h+' entries=['+hs.join(',')+'] -> FORCE x1=0xa5f426a776aa7ff ***'); }
+                        this.context.x1 = FORCE_TOP; }
+                }catch(e){}
+            },
+            onLeave:function(r){ if(this.w) alog('FindAppearance RESULT '+this.w+' -> '+(r.isNull()?'NULL':r)); }
+        });
+        alog('FindAppearance hook @ base+0xcb12bc OK (detect OUR template + force bare name)');
+    }catch(e){ alog('FindAppearance hook err '+e); }
+    var schedN=0;
+    try{
+        Interceptor.attach(base.add(0xca0adc), {
+            onEnter:function(a){ schedN++; if(schedN<=40) alog('ScheduleAppearanceBuildingJobs FIRED #'+schedN+' x0='+a[0]); }
+        });
+        alog('ScheduleAppearanceBuildingJobs hook @ base+0xca0adc OK');
+    }catch(e){ alog('Schedule hook err '+e); }
+    // AppearanceResource::FindAppearanceDefinition FUN_100ad7048(out, appRes, CName, u32, u8) — the .app
+    // appearance resolver (param_3 = appearance CName). If THIS fires with our appearance name, the entity
+    // loaded + reached the .app (problem is downstream at mesh/garment); if it never fires, the entity
+    // never reached .app resolution (stall is at entity-load).
+    var APPWATCH={ '0xa5f426a776aa7ff':'melgardens_swim_string_top_', '0xc86606f3c24e7fe9':'melgardens_swim_string_bottom_', '0x4b5dd0abbc6fc1e4':'black' };
+    var fadN=0;
+    try{
+        Interceptor.attach(base.add(0xad7048), {
+            onEnter:function(a){ var h=a[2].toString(); if(APPWATCH[h]){ alog('*** FindAppearanceDefinition REQUEST appCName='+APPWATCH[h]+' ('+h+') appRes='+a[1]+' ***'); }
+                else if(fadN<10){ fadN++; alog('  (FAD calib) appCName='+h); } },
+            onLeave:function(r){ if(this.w){} }
+        });
+        alog('FindAppearanceDefinition hook @ base+0xad7048 OK');
+    }catch(e){ alog('FAD hook err '+e); }
+})();
+
+// installStreamProbe (blocker #1 diagnosis): does our _root.ent (and the .app/_top.ent/mesh chain) actually
+// STREAM from the depot, and does the ItemFactoryRequest state machine advance past state 2 (the token-wait that
+// "keeps loading forever")? Resource-cache lookup FUN_1021b4d58(x0, x1=ResourcePath) @0x21b4d58; request state
+// machine FUN_1036e783c(x0=req) @0x36e783c, state at req+0x108 (stuck at 2 == loading forever, 3 == FindAppearance runs).
+(function installStreamProbe(){
+    var LOG='/tmp/cp2077_stream.log';
+    function slog(s){ try{var f=new File(LOG,'a');f.write(s+'\n');f.flush();f.close();}catch(e){} try{console.log('[STREAM] '+s);}catch(e){} }
+    try{var f0=new File(LOG,'w');f0.write('=== stream + state probe ===\n');f0.close();}catch(e){}
+    var base; try{base=getModuleBase();}catch(e){base=null;} if(!base){ slog('no base'); return; }
+    var PATHS={ '0xe1d11df4d38d1d94':'_root.ent', '0x771984f3462f40ff':'.app', '0xc67175c8c7bf85c5':'_top.ent', '0x1c41dc56f1d3b1ae':'top_base_body.mesh' };
+    var seen={}, n=0;
+    try{
+        Interceptor.attach(base.add(0x21b4d58), { onEnter:function(a){ try{ var h=a[1].toString(); if(PATHS[h] && n<60){ n++; slog('RESLOOKUP '+PATHS[h]+' ('+h+')'); } }catch(e){} } });
+        slog('resource-lookup hook @ base+0x21b4d58 OK (watch _root.ent/.app/_top.ent/mesh)');
+    }catch(e){ slog('reslookup hook err '+e); }
+    var states={}, sN=0;
+    try{
+        Interceptor.attach(base.add(0x36e783c), { onEnter:function(a){ try{
+            var req=a[0]; var st=req.add(0x108).readU32(); var key=req.toString()+':'+st;
+            if(!states[key] && sN<120){ states[key]=1; sN++; slog('STATE req='+req+' -> '+st); }
+        }catch(e){} } });
+        slog('itemfactory state-machine hook @ base+0x36e783c OK (req+0x108 state; stuck@2=loading-forever, 3=FindAppearance)');
+    }catch(e){ slog('state hook err '+e); }
+    // PLAYER garment build flow (the one actually running on equip). ComputePlayerGarment 0x3710004,
+    // ProcessGarment 0xae6660, item-factory state-3 LoadAppearance/FindAppearance bridge 0x36e7e58.
+    // Log when each fires (capped) to see whether the player garment rebuild reaches our item.
+    var cpgN=0,pgN=0,br3=0;
+    try{ Interceptor.attach(base.add(0x3710004),{ onEnter:function(a){ if(cpgN<15){cpgN++; slog('ComputePlayerGarment FIRED #'+cpgN+' x0='+a[0]);} } }); slog('ComputePlayerGarment hook @0x3710004 OK'); }catch(e){ slog('cpg hook err '+e); }
+    try{ Interceptor.attach(base.add(0xae6660),{ onEnter:function(a){ if(pgN<20){pgN++; slog('ProcessGarment FIRED #'+pgN+' x0='+a[0]);} } }); slog('ProcessGarment hook @0xae6660 OK'); }catch(e){ slog('pg hook err '+e); }
+    try{ Interceptor.attach(base.add(0x36e7e58),{ onEnter:function(a){ if(br3<15){br3++; slog('LoadAppearanceBridge(state3) FIRED #'+br3+' req='+a[0]);} } }); slog('LoadAppearanceBridge hook @0x36e7e58 OK'); }catch(e){ slog('br3 hook err '+e); }
 })();
 
 })();
