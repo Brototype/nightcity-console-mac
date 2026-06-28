@@ -1692,39 +1692,73 @@ try { cmnLog('=== cybermodman custom-names init ==='); cmnLoad(); cmnInstall(); 
     function rlog(s){ try{ var f=new File(LOG,'a'); f.write(s+'\n'); f.flush(); f.close(); }catch(e){} try{console.log('[FXRESEAL] '+s);}catch(e){} }
     var base; try{base=getModuleBase();}catch(e){base=null;}
     if(!base){ rlog('reseal: no base'); return; }
-    var ROOTENT = ptr('0xe1d11df4d38d1d94');   // base\melgardens\swim_string\paperwork\melgardens_swim_string_root.ent
-    var WANT={ '0xa5f426a776aa7ff':'melgardens_swim_string_top_', '0xc86606f3c24e7fe9':'melgardens_swim_string_bottom_' };
+
+    // GENERALIZED (any clothing mod): build the watched entityName->root.ent set from the deployed
+    // config `/tmp/cp2077_xl_items.txt` (one "entityName<TAB>rootEntPath" per line, written by
+    // `melpack factories`). Each entry's CName = fnv1a64(entityName) and its _root.ent ResourcePath =
+    // fnv1a64(sanitize(path)). These two hashers are engine-exact (the disabled installFactoryIndex
+    // XCHECK'd them against the engine's own ResourcePath::Create). BigInt is available in this runtime.
+    function fnv1a64(s){ var h=BigInt('0xCBF29CE484222325'), P=BigInt('0x100000001b3'), M=(BigInt(1)<<BigInt(64))-BigInt(1);
+        for(var i=0;i<s.length;i++){ var b=s.charCodeAt(i)&0xff; if(b>=0x80)b-=256; h^=(BigInt(b)&M); h=(h*P)&M; } return h; }
+    function sanitize(p){ if(!p) return ''; var MAX=199,o='',i=0;
+        if(p[0]==='"'||p[0]==="'") i++;
+        while(i<p.length && (p[i]==='/'||p[i]==='\\')) i++;
+        while(i<p.length && p[i]!=='"' && p[i]!=="'"){ var c=p[i];
+            if(c==='/'||c==='\\'){ o+='\\'; i++; while(i<p.length && (p[i]==='/'||p[i]==='\\')) i++; }
+            else { o+=(c>='A'&&c<='Z')?c.toLowerCase():c; i++; }
+            if(o.length===MAX) break; }
+        return o; }
+    function hx(big){ return '0x'+big.toString(16); }   // matches NativePointer.toString() (lowercase, no leading zero)
+
+    // ENTRIES: cnHex -> { name, resHex }. cnHex matches a[1].toString() at the cc0bec call site.
+    var ENTRIES={}, ncfg=0;
+    try { var t=File.readAllText('/tmp/cp2077_xl_items.txt');
+        if(t){ t.split('\n').forEach(function(line){ line=line.replace(/\r$/,'').trim(); if(!line||line[0]==='#') return;
+            var parts=line.split('\t'); if(parts.length<2) return;
+            var name=parts[0].trim(), path=parts[1].trim(); if(!name||!path) return;
+            ENTRIES[hx(fnv1a64(name))]={ name:name, resHex:hx(fnv1a64(sanitize(path))) }; ncfg++; }); }
+    } catch(e){ rlog('read items cfg err '+e); }
+    if(ncfg===0){
+        // legacy fallback (no cfg deployed): the bikini top_/bottom_ -> melgardens_swim_string_root.ent,
+        // so M2 v1 keeps rendering exactly as before.
+        ENTRIES['0xa5f426a776aa7ff']={ name:'melgardens_swim_string_top_', resHex:'0xe1d11df4d38d1d94' };
+        ENTRIES['0xc86606f3c24e7fe9']={ name:'melgardens_swim_string_bottom_', resHex:'0xe1d11df4d38d1d94' };
+        rlog('no items cfg -> legacy bikini fallback');
+    } else { rlog('loaded '+ncfg+' factory item(s) from /tmp/cp2077_xl_items.txt'); }
+    Object.keys(ENTRIES).forEach(function(cn){ rlog('  ENTRY '+ENTRIES[cn].name+' cn='+cn+' -> root.ent '+ENTRIES[cn].resHex); });
+
     // ROBUST FIX: actually INSERT a synthesized row into the live equip factory's +0x68 (so EVERY
     // consumer resolves, not just FUN_100cc0bec). Row {+0=CName, +0x18->token(_root.ent path)}; the
     // engine's own per-row inserter FUN_10096c938(scratch, factory+0x68, rowPtr, &rowPtr) links it in.
-    // onLeave override remains as a belt-and-suspenders fallback.
+    // onLeave override remains as a belt-and-suspenders fallback (per-entry _root.ent ResourcePath).
     var insert=null;
     try{ insert=new NativeFunction(base.add(0x96c938),'void',['pointer','pointer','pointer','pointer']); }catch(e){ rlog('insert NF err '+e); }
     var scratch=Memory.alloc(64), rows={};
-    Object.keys(WANT).forEach(function(cn){
-        var tok=Memory.alloc(8); tok.writeU64(uint64('0xe1d11df4d38d1d94'));
+    Object.keys(ENTRIES).forEach(function(cn){
+        var e=ENTRIES[cn];
+        var tok=Memory.alloc(8); tok.writeU64(uint64(e.resHex));
         var row=Memory.alloc(0x20);
         for(var i=0;i<0x20;i+=8) row.add(i).writeU64(uint64(0));
         row.writeU64(uint64(cn)); row.add(0x18).writePointer(tok);
         var rv=Memory.alloc(8); rv.writePointer(row);
-        rows[cn]={row:row, rv:rv};
+        rows[cn]={row:row, rv:rv, resPtr:ptr(e.resHex)};
     });
     var inserted={}, ovLog=0, missLog=0, missSeen={};
     try{
         Interceptor.attach(base.add(0xcc0bec), {
             onEnter:function(a){ this.cn=a[1].toString(); this.fac=a[0];
-                try{ if(WANT[this.cn] && insert){ var k=this.fac.toString()+':'+this.cn; if(!inserted[k]){ inserted[k]=1; var rr=rows[this.cn]; insert(scratch, this.fac.add(0x68), rr.row, rr.rv); rlog('INSERT '+WANT[this.cn]+' row -> +0x68 of fac='+this.fac); } } }catch(e){ rlog('insert err '+e); }
+                try{ if(ENTRIES[this.cn] && insert){ var k=this.fac.toString()+':'+this.cn; if(!inserted[k]){ inserted[k]=1; var rr=rows[this.cn]; insert(scratch, this.fac.add(0x68), rr.row, rr.rv); rlog('INSERT '+ENTRIES[this.cn].name+' row -> +0x68 of fac='+this.fac); } } }catch(e){ rlog('insert err '+e); }
             },
             onLeave:function(r){
                 try{
-                    if(WANT[this.cn]){
-                        if(r.isNull()){ r.replace(ROOTENT); if(ovLog<12){ ovLog++; rlog('OVERRIDE(fallback) cc0bec: '+WANT[this.cn]+' -> _root.ent'); } }
-                        else if(ovLog<12){ ovLog++; rlog('*** cc0bec '+WANT[this.cn]+' RESOLVED -> '+r+' (insert worked) ***'); }
+                    if(ENTRIES[this.cn]){
+                        if(r.isNull()){ r.replace(rows[this.cn].resPtr); if(ovLog<12){ ovLog++; rlog('OVERRIDE(fallback) cc0bec: '+ENTRIES[this.cn].name+' -> _root.ent'); } }
+                        else if(ovLog<12){ ovLog++; rlog('*** cc0bec '+ENTRIES[this.cn].name+' RESOLVED -> '+r+' (insert worked) ***'); }
                     } else if(r.isNull() && missLog<40 && !missSeen[this.cn]){ missSeen[this.cn]=1; missLog++; rlog('  (cc0bec miss) x1='+this.cn); }
                 }catch(e){ rlog('override err '+e); }
             }
         });
-        rlog('factory insert+override hook @ base+0xcc0bec watch='+Object.keys(WANT).join(','));
+        rlog('factory insert+override hook @ base+0xcc0bec watch='+Object.keys(ENTRIES).join(','));
     }catch(e){ rlog('attach err '+e); }
 })();
 
