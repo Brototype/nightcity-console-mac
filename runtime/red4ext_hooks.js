@@ -1799,21 +1799,10 @@ try { cmnLog('=== cybermodman custom-names init ==='); cmnLoad(); cmnInstall(); 
                 var key = r ? r.base.toString() : fa.toString();
                 tried[key]=(tried[key]||0)+1;
                 var prot = r ? r.protection : '<no-range>';
-                if(logged<24){ logged++; flog('AV #'+logged+' pc='+pc+' addr='+fa+' range='+(r?(r.base+' sz='+r.size+' prot='+prot):'<none>')+' try#'+tried[key]+' bytes=['+hexAt(fa)+']'); }
-                if(r && prot.indexOf('x')<0 && tried[key]<=3){
-                    // Make the page executable AND flush the I-cache. Memory.patchCode does the full
-                    // W^X-safe make-writable -> (no-op) -> make-executable + icache-invalidate dance, which
-                    // bare Memory.protect skips (leaving stale icache -> SIGILL). 16 KB Apple-Silicon page.
-                    var PAGE=16384, pageBase=fa.and(ptr(PAGE-1).not());
-                    var done=false;
-                    try{ Memory.patchCode(pageBase, PAGE, function(code){ /* keep bytes; force exec + icache flush */ });
-                         done=true; if(fixed<16){fixed++; flog('  -> patchCode '+pageBase+' OK; after=['+hexAt(fa)+'] insn='+disAt(fa));} }
-                    catch(e){ flog('  patchCode failed: '+e+' ; fallback Memory.protect r-x');
-                              try{ Memory.protect(r.base, r.size, 'r-x'); done=true; if(fixed<16){fixed++; flog('  -> protect r-x; after=['+hexAt(fa)+'] insn='+disAt(fa));} }catch(e2){ flog('  protect failed: '+e2); } }
-                    if(done){ var r2=null; try{r2=Process.findRangeByAddress(fa);}catch(e){} var np=r2?r2.protection:'?'; if(np.indexOf('x')>=0){ flog('  now prot='+np+' RESUME'); return true; } flog('  still not exec (now '+np+')'); }
-                    return false;
-                }
-                if(tried[key]>3){ flog('  re-fault x'+tried[key]+' at '+key+' (could not fix) -> let crash'); return false; }
+                // LOG-ONLY: do NOT patch/resume. The earlier auto-fix-and-resume turned a single clean fault
+                // into a runaway cascade through rw- data pages (and could mask whether a gum change actually
+                // worked). Just record the fault and let the process crash/handle normally (return false).
+                if(logged<24){ logged++; flog('AV #'+logged+' pc='+pc+' addr='+fa+' range='+(r?(r.base+' sz='+r.size+' prot='+prot):'<none>')+' (LOG-ONLY, not resuming)'); }
                 return false;
             }catch(e){ try{flog('handler err '+e);}catch(_){}; return false; }
         });
