@@ -1770,6 +1770,57 @@ try { cmnLog('=== cybermodman custom-names init ==='); cmnLoad(); cmnInstall(); 
     }catch(e){ rlog('attach err '+e); }
 })();
 
+// ===== W^X keystone: live trampoline-page fix + diagnostic =====
+// The @dynamic garment path crashes when an ArchiveXL HookAfter (OnResolveSuffixes / OnLoadMaterials)
+// calls the ORIGINAL through a frida-gum 'original' trampoline: a red engine WORKER thread executes it
+// and hits EXC_BAD_ACCESS/KERN_PROTECTION_FAILURE because that specific trampoline page lacks 'x'
+// (the entry trampoline on the same thread runs fine -> it is per-PAGE, not per-thread). We catch the
+// access-violation, make the faulting page executable, and RESUME. If Memory.protect can flip it, that
+// IS the macOS-27 W^X fix (no RED4ext rebuild). The 'tried' guard prevents an infinite re-fault loop.
+(function installWXFix(){
+    var FLOG='/tmp/cp2077_fault.log';
+    function flog(s){ try{var f=new File(FLOG,'a');f.write(s+'\n');f.flush();f.close();}catch(e){} try{console.log('[WXFIX] '+s);}catch(e){} }
+    try{var f0=new File(FLOG,'w');f0.write('=== W^X fault handler armed ===\n');f0.close();}catch(e){}
+    var tried={}, fixed=0, logged=0;
+    try{
+        function hexAt(a,n){ try{var b=new Uint8Array(Memory.readByteArray(a,n||16)); return Array.prototype.map.call(b,function(x){return ('0'+x.toString(16)).slice(-2);}).join(' ');}catch(e){return '<rd '+e+'>';} }
+        function disAt(a){ try{return Instruction.parse(a).toString();}catch(e){return '<dis '+e+'>';} }
+        Process.setExceptionHandler(function(d){
+            try{
+                var fa=d.address, pc=(d.context?d.context.pc:null);
+                // SIGILL: the page is executable but the bytes are not a valid instruction. Dump them so we
+                // can tell incomplete-trampoline (zeros/garbage) from stale-icache (valid-looking insn).
+                if(d.type==='illegal-instruction'){
+                    if(logged<24){ logged++; flog('SIGILL pc='+pc+' addr='+fa+' bytes=['+hexAt(fa)+'] insn='+disAt(fa)); }
+                    return false;
+                }
+                if(d.type!=='access-violation'){ if(logged<24){logged++; flog('EXC type='+d.type+' addr='+fa);} return false; }
+                var r=null; try{ r=Process.findRangeByAddress(fa); }catch(e){}
+                var key = r ? r.base.toString() : fa.toString();
+                tried[key]=(tried[key]||0)+1;
+                var prot = r ? r.protection : '<no-range>';
+                if(logged<24){ logged++; flog('AV #'+logged+' pc='+pc+' addr='+fa+' range='+(r?(r.base+' sz='+r.size+' prot='+prot):'<none>')+' try#'+tried[key]+' bytes=['+hexAt(fa)+']'); }
+                if(r && prot.indexOf('x')<0 && tried[key]<=3){
+                    // Make the page executable AND flush the I-cache. Memory.patchCode does the full
+                    // W^X-safe make-writable -> (no-op) -> make-executable + icache-invalidate dance, which
+                    // bare Memory.protect skips (leaving stale icache -> SIGILL). 16 KB Apple-Silicon page.
+                    var PAGE=16384, pageBase=fa.and(ptr(PAGE-1).not());
+                    var done=false;
+                    try{ Memory.patchCode(pageBase, PAGE, function(code){ /* keep bytes; force exec + icache flush */ });
+                         done=true; if(fixed<16){fixed++; flog('  -> patchCode '+pageBase+' OK; after=['+hexAt(fa)+'] insn='+disAt(fa));} }
+                    catch(e){ flog('  patchCode failed: '+e+' ; fallback Memory.protect r-x');
+                              try{ Memory.protect(r.base, r.size, 'r-x'); done=true; if(fixed<16){fixed++; flog('  -> protect r-x; after=['+hexAt(fa)+'] insn='+disAt(fa));} }catch(e2){ flog('  protect failed: '+e2); } }
+                    if(done){ var r2=null; try{r2=Process.findRangeByAddress(fa);}catch(e){} var np=r2?r2.protection:'?'; if(np.indexOf('x')>=0){ flog('  now prot='+np+' RESUME'); return true; } flog('  still not exec (now '+np+')'); }
+                    return false;
+                }
+                if(tried[key]>3){ flog('  re-fault x'+tried[key]+' at '+key+' (could not fix) -> let crash'); return false; }
+                return false;
+            }catch(e){ try{flog('handler err '+e);}catch(_){}; return false; }
+        });
+        flog('exception handler installed (Process.setExceptionHandler)');
+    }catch(e){ flog('install err '+e); }
+})();
+
 // installAppearanceProbe (Track A diagnostic): read-only probes to pinpoint WHERE custom-clothing
 // appearance resolution breaks. Hooks EntityTemplate::FindAppearance (does our literal appearance
 // resolve to a template entry?) + ScheduleAppearanceBuildingJobs (did the engine start building the
@@ -1784,9 +1835,21 @@ try { cmnLog('=== cybermodman custom-names init ==='); cmnLoad(); cmnInstall(); 
     var WATCH={ '0xa5f426a776aa7ff':'melgardens_swim_string_top_',
                 '0x4b5dd0abbc6fc1e4':'black',
                 '0xc86606f3c24e7fe9':'melgardens_swim_string_bottom_' };
-    // our entity's appearance-entry CNames (to recognize OUR _root.ent template when it's queried)
+    // our entity's appearance-entry CNames (to recognize OUR _root.ent template when it's queried).
+    // Seeded with the bikini defaults, then EXTENDED from /tmp/cp2077_xl_appearances.txt (the ArchiveXL
+    // appearance handoff: one "<cnameHex>\t<name>" per mod root.ent appearance entry) so ANY mod's
+    // templates are recognized + force-resolved, not just the bikini. Same format the engine reports.
     var OURS={ '0xa5f426a776aa7ff':1, '0xc86606f3c24e7fe9':1 };
-    var FORCE_TOP = ptr('0xa5f426a776aa7ff');   // our bare top appearance name (no &Female/&FPP suffix)
+    var OURS_NAME={ '0xa5f426a776aa7ff':'melgardens_swim_string_top_', '0xc86606f3c24e7fe9':'melgardens_swim_string_bottom_' };
+    try{
+        var atxt=File.readAllText('/tmp/cp2077_xl_appearances.txt');
+        if(atxt){ atxt.split('\n').forEach(function(ln){ ln=(ln||'').trim(); if(!ln||ln[0]==='#') return;
+            var parts=ln.split('\t'); var k=(parts[0]||'').trim().toLowerCase(); if(k.indexOf('0x')!==0) return;
+            var norm='0x'+BigInt(k).toString(16);   // strip leading zeros -> matches the engine's reported CName
+            OURS[norm]=1; OURS_NAME[norm]=(parts[1]||'').trim(); }); }
+        alog('appearance handoff: '+Object.keys(OURS).length+' mod appearance entr(ies) recognized');
+    }catch(e){ alog('appearances file load err '+e); }
+    var FORCE_TOP = ptr('0xa5f426a776aa7ff');   // bikini bare top (preferred bikini force; no regression)
     // cheap detector: ONLY scan small templates (our _root.ent has 2 entries; NPC/player templates have many),
     // so this stays light even during city load. Returns entry hashes if this is OUR template, else null.
     function templateIsOurs(tmpl){
@@ -1809,8 +1872,14 @@ try { cmnLog('=== cybermodman custom-names init ==='); cmnLoad(); cmnInstall(); 
                 // FIX #2 + confirm: if this is OUR _root.ent template, log the searched name and FORCE the
                 // bare top appearance so a &Female/&FPP-suffixed search still resolves.
                 try{ var hs=templateIsOurs(this.tmpl);
-                    if(hs){ if(ourSeen<25){ ourSeen++; alog('*** OUR _root.ent QUERIED: searched='+h+' entries=['+hs.join(',')+'] -> FORCE x1=0xa5f426a776aa7ff ***'); }
-                        this.context.x1 = FORCE_TOP; }
+                    if(hs){
+                        // force x1 to the bare mod appearance entry: prefer the bikini top (no regression),
+                        // else the first of THIS template's own entries that is a known mod appearance.
+                        var ft = OURS['0xa5f426a776aa7ff'] && hs.indexOf('0xa5f426a776aa7ff')>=0 ? '0xa5f426a776aa7ff' : null;
+                        if(!ft){ for(var fi=0;fi<hs.length;fi++){ if(OURS[hs[fi]]){ ft=hs[fi]; break; } } }
+                        if(ft){ if(ourSeen<25){ ourSeen++; alog('*** OUR _root.ent QUERIED: searched='+h+' entries=['+hs.join(',')+'] -> FORCE x1='+ft+' ('+(OURS_NAME[ft]||'?')+') ***'); }
+                            this.context.x1 = ptr(ft); }
+                    }
                 }catch(e){}
             },
             onLeave:function(r){ if(this.w) alog('FindAppearance RESULT '+this.w+' -> '+(r.isNull()?'NULL':r)); }
