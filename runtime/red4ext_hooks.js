@@ -1814,7 +1814,14 @@ try { cmnLog('=== cybermodman custom-names init ==='); cmnLoad(); cmnInstall(); 
 // appearance resolution breaks. Hooks EntityTemplate::FindAppearance (does our literal appearance
 // resolve to a template entry?) + ScheduleAppearanceBuildingJobs (did the engine start building the
 // garment = appearance resolved end-to-end?). Filtered to our 3 watched CNames + a short calibration.
+// When RED4ext's GarmentExtension owns the appearance/garment functions (Garment gate + manual inline
+// hooks), the gadget must NOT also hook them: its Frida redirect overwrites the prologue, so RED4ext's
+// manual hook reads a branch (PC-relative) and falls back to the broken gum path. false = RED4ext owns
+// 0xcb12bc / 0x3710004 / 0xae6660; the gadget skips them.
+var CET_OWNS_GARMENT = true;   // true = gadget owns the appearance path (bikini literal force works). Set FALSE
+                               // ONLY for the @dynamic Garment-gate experiment (RED4ext manual hooks own it then).
 (function installAppearanceProbe(){
+    if(!CET_OWNS_GARMENT){ try{console.log('[APPRPROBE] disabled (RED4ext owns the appearance path)');}catch(e){} return; }
     var LOG='/tmp/cp2077_appearance.log';
     function alog(s){ try{var f=new File(LOG,'a');f.write(s+'\n');f.flush();f.close();}catch(e){} try{console.log('[APPRPROBE] '+s);}catch(e){} }
     try{var f0=new File(LOG,'w');f0.write('=== appearance probe (Track A) ===\n');f0.close();}catch(e){}
@@ -1854,7 +1861,7 @@ try { cmnLog('=== cybermodman custom-names init ==='); cmnLoad(); cmnInstall(); 
     }
     var calib=0, ourSeen=0;
     try{
-        Interceptor.attach(base.add(0xcb12bc), {
+        if(CET_OWNS_GARMENT) Interceptor.attach(base.add(0xcb12bc), {
             onEnter:function(a){ this.tmpl=a[0]; var h=a[1].toString(); this.h=h; this.w=WATCH[h];
                 if(this.w) alog('FindAppearance REQUEST name='+this.w+' ('+h+')');
                 else if(calib<6){ calib++; alog('  (calib) x1='+h); }
@@ -1903,6 +1910,7 @@ try { cmnLog('=== cybermodman custom-names init ==='); cmnLoad(); cmnInstall(); 
 // "keeps loading forever")? Resource-cache lookup FUN_1021b4d58(x0, x1=ResourcePath) @0x21b4d58; request state
 // machine FUN_1036e783c(x0=req) @0x36e783c, state at req+0x108 (stuck at 2 == loading forever, 3 == FindAppearance runs).
 (function installStreamProbe(){
+    if(!CET_OWNS_GARMENT){ try{console.log('[STREAM] disabled (RED4ext owns the appearance path)');}catch(e){} return; }
     var LOG='/tmp/cp2077_stream.log';
     function slog(s){ try{var f=new File(LOG,'a');f.write(s+'\n');f.flush();f.close();}catch(e){} try{console.log('[STREAM] '+s);}catch(e){} }
     try{var f0=new File(LOG,'w');f0.write('=== stream + state probe ===\n');f0.close();}catch(e){}
@@ -1925,8 +1933,8 @@ try { cmnLog('=== cybermodman custom-names init ==='); cmnLoad(); cmnInstall(); 
     // ProcessGarment 0xae6660, item-factory state-3 LoadAppearance/FindAppearance bridge 0x36e7e58.
     // Log when each fires (capped) to see whether the player garment rebuild reaches our item.
     var cpgN=0,pgN=0,br3=0;
-    try{ Interceptor.attach(base.add(0x3710004),{ onEnter:function(a){ if(cpgN<15){cpgN++; slog('ComputePlayerGarment FIRED #'+cpgN+' x0='+a[0]);} } }); slog('ComputePlayerGarment hook @0x3710004 OK'); }catch(e){ slog('cpg hook err '+e); }
-    try{ Interceptor.attach(base.add(0xae6660),{ onEnter:function(a){ if(pgN<20){pgN++; slog('ProcessGarment FIRED #'+pgN+' x0='+a[0]);} } }); slog('ProcessGarment hook @0xae6660 OK'); }catch(e){ slog('pg hook err '+e); }
+    try{ if(CET_OWNS_GARMENT) Interceptor.attach(base.add(0x3710004),{ onEnter:function(a){ if(cpgN<15){cpgN++; slog('ComputePlayerGarment FIRED #'+cpgN+' x0='+a[0]);} } }); slog('ComputePlayerGarment hook @0x3710004 '+(CET_OWNS_GARMENT?'OK':'SKIPPED (RED4ext owns)')); }catch(e){ slog('cpg hook err '+e); }
+    try{ if(CET_OWNS_GARMENT) Interceptor.attach(base.add(0xae6660),{ onEnter:function(a){ if(pgN<20){pgN++; slog('ProcessGarment FIRED #'+pgN+' x0='+a[0]);} } }); slog('ProcessGarment hook @0xae6660 '+(CET_OWNS_GARMENT?'OK':'SKIPPED (RED4ext owns)')); }catch(e){ slog('pg hook err '+e); }
     try{ Interceptor.attach(base.add(0x36e7e58),{ onEnter:function(a){ if(br3<15){br3++; slog('LoadAppearanceBridge(state3) FIRED #'+br3+' req='+a[0]);} } }); slog('LoadAppearanceBridge hook @0x36e7e58 OK'); }catch(e){ slog('br3 hook err '+e); }
 })();
 
