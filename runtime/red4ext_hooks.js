@@ -1131,6 +1131,7 @@ rpc.exports = {
 // ===== cybermodman cmn loc-hook (re-merged after CET update) =====
 var cmnB = getModuleBase();
 var CMN_CONFIG = '/Users/ysr/Library/Application Support/Steam/steamapps/common/Cyberpunk 2077/red4ext/cybermodman_names.json';
+var CMN_XL_LOC = '/tmp/cp2077_xl_loc.json';   // ArchiveXL macOS localization handoff (per-mod onscreens -> {fnv32/fnv64-low: text}). Auto-dumped by ArchiveXL on bring-up; served here since the engine LoadTexts merge cannot be caught post-load on macOS.
 var CMN_LOG = '/tmp/cybermodman_names.log';
 var cmnMap = {};
 var cmnHit = {}; // cybermodman: runtime fill hit-counter per LocKey (throttled logging)
@@ -1139,11 +1140,11 @@ var cmnBase = null;
 var cmnReserve = null;   // NativeFunction(FUN_10002c904): grows a CString to a game-pool heap buffer
 var cmnAttached = false;
 function cmnLog(s){ try{ var f=new File(CMN_LOG,'a'); f.write(s+'\n'); f.flush(); f.close(); }catch(e){} try{ console.log('[CMN] '+s); }catch(e2){} }
-function cmnLoad(){
-    cmnMap = {}; var n = 0;
+function cmnLoadFile(path, label, verbose){
+    var n = 0;
     try {
-        var txt = File.readAllText(CMN_CONFIG);
-        if (!txt) { cmnLog('no config file at '+CMN_CONFIG); return 0; }
+        var txt = File.readAllText(path);
+        if (!txt) { return 0; }
         var obj = JSON.parse(txt);
         for (var k in obj) {
             if (!obj.hasOwnProperty(k)) continue;
@@ -1153,10 +1154,17 @@ function cmnLoad(){
             var ki = kp >>> 0;
             cmnMap[ki] = String(obj[k]);
             n++;
-            cmnLog('  map LocKey '+ki+' (0x'+ki.toString(16)+') -> "'+cmnMap[ki]+'"');
+            if (verbose) cmnLog('  map LocKey '+ki+' (0x'+ki.toString(16)+') -> "'+cmnMap[ki]+'"');
         }
-        cmnLog('loaded '+n+' custom name(s)');
-    } catch (e) { cmnLog('config error: '+e); }
+        cmnLog('loaded '+n+' name(s) from '+label);
+    } catch (e) { cmnLog(label+' load error: '+e); }
+    return n;
+}
+function cmnLoad(){
+    cmnMap = {};
+    var n = cmnLoadFile(CMN_CONFIG, 'cybermodman_names.json', true);
+    n += cmnLoadFile(CMN_XL_LOC, 'cp2077_xl_loc.json (ArchiveXL)', false);   // mod localization handoff (quiet; can be large)
+    cmnLog('total custom name(s): '+n);
     return n;
 }
 // Write a CString into the engine's output buffer at b. Short strings go inline (proven path).
