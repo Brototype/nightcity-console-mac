@@ -1089,7 +1089,7 @@ rpc.exports = {
             // Q7: Lua Game.* call bridge - a separate synchronous channel (lreq -> lres), queued like a command
             const lq=readFile(LREQ); const ls=(lq||'').trim();
             if(!ls){ lastLReq=''; }
-            else if(ls!==lastLReq){ lastLReq=ls; handleLuaCall('lua-call\t'+ls); clearFile(LREQ); } }catch(e){} }, 120);
+            else if(ls!==lastLReq){ lastLReq=ls; handleLuaCall('lua-call\t'+ls); clearFile(LREQ); } }catch(e){} }, 500);  // perf: was 120ms (8-9 JS wakeups+file reads/sec, forever). 500ms = ~2/sec; console/lua-bridge latency stays imperceptible, and with the overlay off by default there's no producer for CMD anyway.
         // Clean shutdown: the game's static-destructor teardown segfaults with hooks attached (cosmetic,
         // happens AFTER the game has saved + quit). Route exit() -> _exit() to skip that teardown so the
         // process exits cleanly (no macOS crash dialog, exit code 0).

@@ -318,6 +318,14 @@ final class Model: ObservableObject {
         env["DYLD_INSERT_LIBRARIES"] = inject
         env["DYLD_FORCE_FLAT_NAMESPACE"] = "1"
         env["SteamAppId"] = "1091500"
+        // Perf: default the in-game ImGui console OFF. It redraws every frame via a presentDrawable swizzle,
+        // measured ~4-5x worse frametime (avg ~13ms -> ~55ms, i.e. ~75 FPS -> ~15 FPS). The overlay's readMode()
+        // checks NCC_MODE (env) before ~/nightcity_mode.txt before its FULL default, so we force env=off ONLY when
+        // the user hasn't made an explicit choice via that file - power users keep `echo full > ~/nightcity_mode.txt`.
+        let modeFile = (NSHomeDirectory() as NSString).appendingPathComponent("nightcity_mode.txt")
+        if !FileManager.default.fileExists(atPath: modeFile) {
+            env["NCC_MODE"] = "off"
+        }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: binaryPath)
         p.currentDirectoryURL = URL(fileURLWithPath: gamePath)
