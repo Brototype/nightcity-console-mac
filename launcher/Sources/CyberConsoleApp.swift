@@ -298,6 +298,8 @@ final class Model: ObservableObject {
         let fileCount: Int
     }
     @Published var mods: [InstalledMod] = []
+    @Published var busy: Bool = false          // an install/remove is running on a background thread
+    @Published var busyDetail: String = ""     // live per-step progress shown in the drop zone
 
     // Per-mod manifests (name + the exact deployed files) live here so uninstall is precise.
     var modsManifestDir: String { "\(gamePath)/red4ext/nightcity/mods" }
@@ -344,34 +346,102 @@ final class Model: ObservableObject {
         mods = found.sorted { $0.name.lowercased() < $1.name.lowercased() }
     }
 
-    // Install a dragged/picked mod (.zip or folder): nctool deploys it (+ writes a manifest), then we
-    // regenerate the handoffs from ALL installed mods.
+    // Like runNctool but streams stdout line-by-line to `onLine` (called on a background thread) so the UI
+    // can show live progress. MUST be called off the main thread - availableData blocks until EOF.
+    @discardableResult
+    func runNctoolStreaming(_ args: [String], onLine: @escaping (String) -> Void) -> (ok: Bool, out: String) {
+        guard let tool = nctoolPath() else { return (false, "nctool helper not found.") }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: tool)
+        p.arguments = args
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
+        do { try p.run() } catch { return (false, "Could not run nctool: \(error.localizedDescription)") }
+        let fh = pipe.fileHandleForReading
+        var all = "", lineBuf = ""
+        while true {
+            let chunk = fh.availableData
+            if chunk.isEmpty { break }              // EOF
+            let s = String(data: chunk, encoding: .utf8) ?? ""
+            all += s; lineBuf += s
+            while let r = lineBuf.range(of: "\n") {
+                onLine(String(lineBuf[lineBuf.startIndex..<r.lowerBound]))
+                lineBuf.removeSubrange(lineBuf.startIndex..<r.upperBound)
+            }
+        }
+        p.waitUntilExit()
+        return (p.terminationStatus == 0, all)
+    }
+
+    // Map a raw nctool log line to a short, player-friendly progress phrase (nil = don't surface it).
+    private func friendlyProgress(_ line: String) -> String? {
+        if line.contains("unzipped") { return "Unpacking…" }
+        if line.contains("-> rawrepack") {
+            let name = line.replacingOccurrences(of: "[INSTALL] archive ", with: "")
+                           .components(separatedBy: " ->").first ?? "archive"
+            return "Optimizing \(name)…"
+        }
+        if line.hasPrefix("[RAWREPACK] re-serialized") { return "Optimizing meshes…" }
+        if line.contains("-> ArchiveXL/Bundle") { return "Installing config…" }
+        if line.contains("r6/tweaks") { return "Installing records…" }
+        if line.hasPrefix("[INSTALL] DONE") { return "Deploying files…" }
+        return nil
+    }
+
+    // Install a dragged/picked mod (.zip or folder). Runs OFF the main thread (rawrepack of a large archive
+    // takes seconds) so the window never beachballs; streams live progress into busyDetail.
     func installMod(from url: URL) {
         guard gameFound else { status = "Game not found."; return }
         guard fullyInstalled() else { status = "Install NightCity Console first, then add mods."; return }
         guard nctoolPath() != nil else { status = "nctool helper missing from the app bundle."; return }
+        guard !busy else { status = "Please wait for the current mod to finish installing."; return }
         let base = url.deletingPathExtension().lastPathComponent
-        let manifest = "\(modsManifestDir)/\(base).json"
-        status = "Installing \(base)…"
-        let r = runNctool(["install", url.path, gamePath, manifest])
-        guard r.ok else { status = "Couldn't install \(base): \(lastLine(r.out))"; return }
-        let g = runNctool(["regen", gamePath])
-        refreshMods()
-        status = g.ok ? "Installed \(base) · click Play." : "Installed \(base) (handoff warning: \(lastLine(g.out)))"
+        busy = true; busyDetail = "Reading \(base)…"; status = "Installing \(base)…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let manifest = "\(self.modsManifestDir)/\(base).json"
+            let r = self.runNctoolStreaming(["install", url.path, self.gamePath, manifest]) { line in
+                if let msg = self.friendlyProgress(line) {
+                    DispatchQueue.main.async { self.busyDetail = msg }
+                }
+            }
+            guard r.ok else {
+                DispatchQueue.main.async {
+                    self.busy = false; self.busyDetail = ""
+                    self.status = "Couldn't install \(base): \(self.lastLine(r.out))"
+                }
+                return
+            }
+            DispatchQueue.main.async { self.busyDetail = "Updating game data…" }
+            let g = self.runNctool(["regen", self.gamePath])
+            DispatchQueue.main.async {
+                self.busy = false; self.busyDetail = ""
+                self.refreshMods()
+                self.status = g.ok ? "Installed \(base) · click Play."
+                                   : "Installed \(base) (game-data warning: \(self.lastLine(g.out)))"
+            }
+        }
     }
 
-    // Uninstall: delete every file the manifest recorded, drop the manifest, regen the handoffs.
+    // Uninstall: delete every file the manifest recorded, drop the manifest, regen the handoffs. Off the main
+    // thread so the regen doesn't beachball the window.
     func removeMod(_ mod: InstalledMod) {
-        let fm = FileManager.default
-        if let data = fm.contents(atPath: mod.manifestPath),
-           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-           let files = obj["files"] as? [String] {
-            for f in files where fm.fileExists(atPath: f) { try? fm.removeItem(atPath: f) }
+        guard !busy else { status = "Please wait for the current operation to finish."; return }
+        busy = true; busyDetail = "Removing \(mod.name)…"; status = "Removing \(mod.name)…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let fm = FileManager.default
+            if let data = fm.contents(atPath: mod.manifestPath),
+               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               let files = obj["files"] as? [String] {
+                for f in files where fm.fileExists(atPath: f) { try? fm.removeItem(atPath: f) }
+            }
+            try? fm.removeItem(atPath: mod.manifestPath)
+            DispatchQueue.main.async { self.busyDetail = "Updating game data…" }
+            self.runNctool(["regen", self.gamePath])
+            DispatchQueue.main.async {
+                self.busy = false; self.busyDetail = ""
+                self.refreshMods()
+                self.status = "Removed \(mod.name)."
+            }
         }
-        try? fm.removeItem(atPath: mod.manifestPath)
-        runNctool(["regen", gamePath])
-        refreshMods()
-        status = "Removed \(mod.name)."
     }
 
     private func lastLine(_ s: String) -> String {
@@ -467,7 +537,7 @@ struct ContentView: View {
             HStack {
                 Text("MODS").font(.caption2).foregroundColor(.secondary)
                 Spacer()
-                Button("Add Mod…") { addMod() }.disabled(!m.installed)
+                Button("Add Mod…") { addMod() }.disabled(!m.installed || m.busy)
             }
             modDropZone
             modsList
@@ -487,21 +557,35 @@ struct ContentView: View {
         .frame(width: 620, height: 640)
     }
 
-    // Dashed drop target: drag a mod .zip or folder onto it to install.
+    // Dashed drop target: drag a mod .zip or folder onto it to install. While an install/remove runs it
+    // shows a spinner + the live step so the app never looks hung.
     var modDropZone: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 8)
                 .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [6]))
                 .foregroundColor(.secondary.opacity(0.5))
-            VStack(spacing: 3) {
-                Image(systemName: "tray.and.arrow.down").font(.title3).foregroundColor(.secondary)
-                Text("Drag a mod .zip or folder here").font(.callout).foregroundColor(.secondary)
-                Text(m.installed ? "or click Add Mod above" : "install NightCity Console first")
-                    .font(.caption2).foregroundColor(.secondary)
+            if m.busy {
+                VStack(spacing: 6) {
+                    ProgressView()
+                    Text(m.busyDetail.isEmpty ? "Working…" : m.busyDetail)
+                        .font(.callout).foregroundColor(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                    Text("this can take a moment for large mods")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+            } else {
+                VStack(spacing: 3) {
+                    Image(systemName: "tray.and.arrow.down").font(.title3).foregroundColor(.secondary)
+                    Text("Drag a mod .zip or folder here").font(.callout).foregroundColor(.secondary)
+                    Text(m.installed ? "or click Add Mod above" : "install NightCity Console first")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
             }
         }
         .frame(height: 70)
-        .onDrop(of: [UTType.fileURL], isTargeted: nil) { providers in handleDrop(providers) }
+        .onDrop(of: [UTType.fileURL], isTargeted: nil) { providers in
+            m.busy ? false : handleDrop(providers)
+        }
     }
 
     @ViewBuilder var modsList: some View {
@@ -518,6 +602,7 @@ struct ContentView: View {
                             Spacer()
                             Button { m.removeMod(mod) } label: { Image(systemName: "trash") }
                                 .buttonStyle(.borderless).foregroundColor(.red)
+                                .disabled(m.busy)
                                 .help("Remove \(mod.name)")
                         }
                         .padding(.horizontal, 6).padding(.vertical, 3)
