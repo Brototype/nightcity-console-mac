@@ -1126,6 +1126,28 @@ rpc.exports = {
                 }catch(e){} },
             onLeave:function(r){ depth--; if(busy) return; if(pendingQ.length&&depth===0){ const cmd=pendingQ.shift(); busy=true; try{ execute(cmd); }catch(e){ log('exec err '+e); } busy=false; } }
         });
+
+        // ---- AUTO-LOAD: apply installed mods on launch, no console needed (NightCity Console increment 4).
+        // Queue `tweakload` then `archiveload` into pendingQ so they run on the ENGINE thread (drained by the
+        // exec hook above), exactly like the manual commands. Both underlying exports are idempotent +
+        // serialized (cybermodman_tweakReload EnsureInitialized, cybermodman_archiveReload compare_exchange),
+        // so queueing at several delays to bracket the TweakDB/depot ready window is harmless - the call that
+        // lands after readiness is the one that takes effect. Disable by creating /tmp/cp2077_no_autoload.
+        try {
+            if (readFile('/tmp/cp2077_no_autoload') === null) {
+                var alDelays = [6000, 14000, 26000, 45000];
+                alDelays.forEach(function (d) {
+                    setTimeout(function () {
+                        try { pendingQ.push('tweakload'); pendingQ.push('archiveload');
+                              log('[AUTOLOAD] queued tweakload+archiveload (+' + d + 'ms)'); }
+                        catch (e) { log('[AUTOLOAD] queue err ' + e); }
+                    }, d);
+                });
+                log('[AUTOLOAD] armed - will apply installed mods at ' + alDelays.join('/') + 'ms after launch');
+            } else {
+                log('[AUTOLOAD] disabled (/tmp/cp2077_no_autoload present)');
+            }
+        } catch (e) { log('[AUTOLOAD] arm err ' + e); }
     }catch(e){ log('MINI-CET v3 FAILED: '+e); }
 
 // ===== cybermodman cmn loc-hook (re-merged after CET update) =====

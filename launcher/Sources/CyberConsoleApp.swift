@@ -265,12 +265,39 @@ final class Model: ObservableObject {
 
     func play() {
         guard gameFound else { status = "Game not found."; return }
+        guard !busy else { status = "Please wait for the current operation to finish."; return }
         if !fullyInstalled() { install() }   // self-heal stale/partial installs
         // pre-flight: every injected dylib must exist, or the game aborts on launch
         let fm = FileManager.default
         let missing = injectDylibs.filter { !fm.fileExists(atPath: "\(red4Dir)/\($0)") }
         guard missing.isEmpty else { status = "Can't launch - missing: \(missing.joined(separator: ", ")). Try Install again."; return }
         guard ensureGameEntitlements() else { return }   // re-sign if a Steam verify/update reset it
+
+        // The mod handoffs live in /tmp, which macOS clears on reboot. If mods are installed but the handoff
+        // is gone, regenerate it before launch so the game auto-loads the mods on this boot. Within a session
+        // (handoff already present, kept fresh by install/remove) this is skipped, so Play stays instant.
+        if nctoolPath() != nil && !mods.isEmpty && !fm.fileExists(atPath: "/tmp/cp2077_xl_items.txt") {
+            busy = true; progress = 0; busyDetail = "Preparing mods…"; status = "Preparing mods…"
+            DispatchQueue.global(qos: .userInitiated).async {
+                self.runNctoolStreaming(["regen", self.gamePath]) { line in
+                    if let p = self.parseProgress(line) {
+                        DispatchQueue.main.async {
+                            self.progress = p.frac
+                            self.busyDetail = (p.label.isEmpty ? "Preparing mods" : p.label) + "…"
+                        }
+                    }
+                }
+                DispatchQueue.main.async {
+                    self.busy = false; self.busyDetail = ""; self.progress = 0
+                    self.launchGame()
+                }
+            }
+        } else {
+            launchGame()
+        }
+    }
+
+    private func launchGame() {
         ensureSteam()
         let inject = "\(red4Dir)/RED4ext.dylib:\(red4Dir)/FridaGadget.dylib:\(red4Dir)/libcyberconsole_overlay.dylib"
         var env = ProcessInfo.processInfo.environment
@@ -283,7 +310,7 @@ final class Model: ObservableObject {
         p.environment = env
         do {
             try p.run()
-            status = "Launched - press  `  or  F1  in-game to open the console."
+            status = "Launched - your mods load automatically. Press  `  or  F1  for the console."
         } catch {
             status = "Launch failed: \(error.localizedDescription)"
         }
@@ -545,7 +572,7 @@ struct ContentView: View {
                 Button(m.installed ? "Reinstall NightCity Console" : "Install") { m.install() }
                     .disabled(!m.gameFound)
                 Button("Play  ▶") { m.play() }
-                    .disabled(!m.installed)
+                    .disabled(!m.installed || m.busy)
                     .keyboardShortcut(.defaultAction)
                 Spacer()
                 Button("Uninstall NightCity Console") { m.uninstall() }
