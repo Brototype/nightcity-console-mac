@@ -300,6 +300,16 @@ final class Model: ObservableObject {
     @Published var mods: [InstalledMod] = []
     @Published var busy: Bool = false          // an install/remove is running on a background thread
     @Published var busyDetail: String = ""     // live per-step progress shown in the drop zone
+    @Published var progress: Double = 0         // 0..1 for the determinate bar (nil-ish when 0 at start)
+
+    // Parse a "[PROGRESS] <fraction> <label>" line emitted by nctool. Returns nil for any other line.
+    private func parseProgress(_ line: String) -> (frac: Double, label: String)? {
+        guard line.hasPrefix("[PROGRESS] ") else { return nil }
+        let rest = line.dropFirst("[PROGRESS] ".count)
+        let parts = rest.split(separator: " ", maxSplits: 1)
+        guard let f = Double(parts.first ?? "") else { return nil }
+        return (f, parts.count > 1 ? String(parts[1]) : "")
+    }
 
     // Per-mod manifests (name + the exact deployed files) live here so uninstall is precise.
     var modsManifestDir: String { "\(gamePath)/red4ext/nightcity/mods" }
@@ -395,25 +405,38 @@ final class Model: ObservableObject {
         guard nctoolPath() != nil else { status = "nctool helper missing from the app bundle."; return }
         guard !busy else { status = "Please wait for the current mod to finish installing."; return }
         let base = url.deletingPathExtension().lastPathComponent
-        busy = true; busyDetail = "Reading \(base)…"; status = "Installing \(base)…"
+        busy = true; progress = 0; busyDetail = "Reading \(base)…"; status = "Installing \(base)…"
         DispatchQueue.global(qos: .userInitiated).async {
             let manifest = "\(self.modsManifestDir)/\(base).json"
+            // Phase 1: deploy (nctool install) drives the bar 0 -> 0.6.
             let r = self.runNctoolStreaming(["install", url.path, self.gamePath, manifest]) { line in
-                if let msg = self.friendlyProgress(line) {
+                if let p = self.parseProgress(line) {
+                    DispatchQueue.main.async {
+                        self.progress = p.frac * 0.6
+                        if !p.label.isEmpty { self.busyDetail = p.label + "…" }
+                    }
+                } else if let msg = self.friendlyProgress(line) {
                     DispatchQueue.main.async { self.busyDetail = msg }
                 }
             }
             guard r.ok else {
                 DispatchQueue.main.async {
-                    self.busy = false; self.busyDetail = ""
+                    self.busy = false; self.busyDetail = ""; self.progress = 0
                     self.status = "Couldn't install \(base): \(self.lastLine(r.out))"
                 }
                 return
             }
-            DispatchQueue.main.async { self.busyDetail = "Updating game data…" }
-            let g = self.runNctool(["regen", self.gamePath])
+            // Phase 2: regenerate game data (nctool regen) drives the bar 0.6 -> 1.0.
+            let g = self.runNctoolStreaming(["regen", self.gamePath]) { line in
+                if let p = self.parseProgress(line) {
+                    DispatchQueue.main.async {
+                        self.progress = 0.6 + p.frac * 0.4
+                        if !p.label.isEmpty { self.busyDetail = p.label + "…" }
+                    }
+                }
+            }
             DispatchQueue.main.async {
-                self.busy = false; self.busyDetail = ""
+                self.busy = false; self.busyDetail = ""; self.progress = 0
                 self.refreshMods()
                 self.status = g.ok ? "Installed \(base) · click Play."
                                    : "Installed \(base) (game-data warning: \(self.lastLine(g.out)))"
@@ -425,7 +448,7 @@ final class Model: ObservableObject {
     // thread so the regen doesn't beachball the window.
     func removeMod(_ mod: InstalledMod) {
         guard !busy else { status = "Please wait for the current operation to finish."; return }
-        busy = true; busyDetail = "Removing \(mod.name)…"; status = "Removing \(mod.name)…"
+        busy = true; progress = 0; busyDetail = "Removing \(mod.name)…"; status = "Removing \(mod.name)…"
         DispatchQueue.global(qos: .userInitiated).async {
             let fm = FileManager.default
             if let data = fm.contents(atPath: mod.manifestPath),
@@ -435,9 +458,13 @@ final class Model: ObservableObject {
             }
             try? fm.removeItem(atPath: mod.manifestPath)
             DispatchQueue.main.async { self.busyDetail = "Updating game data…" }
-            self.runNctool(["regen", self.gamePath])
+            self.runNctoolStreaming(["regen", self.gamePath]) { line in
+                if let p = self.parseProgress(line) {
+                    DispatchQueue.main.async { self.progress = p.frac; if !p.label.isEmpty { self.busyDetail = p.label + "…" } }
+                }
+            }
             DispatchQueue.main.async {
-                self.busy = false; self.busyDetail = ""
+                self.busy = false; self.busyDetail = ""; self.progress = 0
                 self.refreshMods()
                 self.status = "Removed \(mod.name)."
             }
@@ -566,13 +593,16 @@ struct ContentView: View {
                 .foregroundColor(.secondary.opacity(0.5))
             if m.busy {
                 VStack(spacing: 6) {
-                    ProgressView()
+                    ProgressView(value: min(max(m.progress, 0), 1))
+                        .progressViewStyle(.linear)
+                        .frame(width: 260)
                     Text(m.busyDetail.isEmpty ? "Working…" : m.busyDetail)
                         .font(.callout).foregroundColor(.secondary)
                         .lineLimit(1).truncationMode(.middle)
-                    Text("this can take a moment for large mods")
+                    Text("\(Int(min(max(m.progress, 0), 1) * 100))%  ·  large mods take a moment")
                         .font(.caption2).foregroundColor(.secondary)
                 }
+                .padding(.horizontal, 12)
             } else {
                 VStack(spacing: 3) {
                     Image(systemName: "tray.and.arrow.down").font(.title3).foregroundColor(.secondary)
