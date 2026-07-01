@@ -23,10 +23,32 @@ SUBZIP="dist/_notarize.zip"     # temporary zip used only for the notarization u
 echo "==> building app (ad-hoc), then re-signing with Developer ID"
 ./launcher/build-app.sh
 
-# Sign every Mach-O inside-out with hardened runtime + secure timestamp (required for notarization).
-find "$APP/Contents/Resources" -name "*.dylib" -print0 | while IFS= read -r -d '' f; do
-  codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$f"
+# The bundled nctool is a self-contained .NET helper that JITs. Under hardened runtime CoreCLR SIGKILLs the
+# instant it writes executable memory unless these entitlements are present (validated locally: JIT + a full
+# Kraken rawrepack run clean with them). Entitlements apply to the apphost EXECUTABLE, not the dylibs.
+NCTOOL_ENTS="$(mktemp -t nctool-ents)"
+cat > "$NCTOOL_ENTS" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>com.apple.security.cs.allow-jit</key><true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+  <key>com.apple.security.cs.disable-library-validation</key><true/>
+</dict></plist>
+PLIST
+NCTOOL_EXE="$APP/Contents/Resources/nctool/nctool"
+
+# Sign every nested Mach-O inside-out with hardened runtime + secure timestamp (required for notarization).
+# This is ALL Mach-O, not just *.dylib: the nctool bundle also ships helper executables (createdump) and the
+# .NET runtime dylibs. The nctool apphost is skipped here and signed next, with the JIT entitlements.
+find "$APP/Contents/Resources" -type f | while IFS= read -r f; do
+  [ "$f" = "$NCTOOL_EXE" ] && continue
+  if file "$f" | grep -q "Mach-O"; then
+    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$f"
+  fi
 done
+codesign --force --options runtime --timestamp --entitlements "$NCTOOL_ENTS" --sign "$SIGN_IDENTITY" "$NCTOOL_EXE"
+rm -f "$NCTOOL_ENTS"
 codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
