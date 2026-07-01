@@ -24,8 +24,17 @@ echo "==> bundling payload into Resources"
 cp runtime/red4ext_hooks.js runtime/FridaGadget.config runtime/cet_catalog.tsv "$APP/Contents/Resources/"
 cp deps/RED4ext.dylib deps/FridaGadget.dylib            "$APP/Contents/Resources/"
 cp build/libcyberconsole_overlay.dylib                  "$APP/Contents/Resources/"
-# CyberModMan creator payload (TweakXL plugin from deps/ + seed names file; launcher deploys these on install)
-cp deps/TweakXL.dylib runtime/cybermodman/cybermodman_names.json "$APP/Contents/Resources/"
+# CyberModMan creator payload: seed the names file + RED4ext's config.ini (enables plugin loading) + AddressLib.
+cp runtime/cybermodman/cybermodman_names.json "$APP/Contents/Resources/"
+cp deps/config.ini deps/cyberpunk2077_addresses.json "$APP/Contents/Resources/" 2>/dev/null \
+  || echo "  [warn] config.ini / cyberpunk2077_addresses.json missing from deps/ (re-run tools/fetch-deps.sh)"
+# Vendor the RED4ext plugins (TweakXL + ArchiveXL) so they ship SELF-CONTAINED: both link against Homebrew
+# spdlog/fmt/yaml-cpp (/opt/homebrew/...), which do not exist on a user's Mac -> the plugins fail to load and
+# the cybermodman_tweakReload/archiveReload exports go missing. vendor-plugin.sh copies each plugin + those 3
+# dylibs into its plugin folder with @loader_path refs. The launcher deploys Resources/plugins -> red4ext/plugins.
+mkdir -p "$APP/Contents/Resources/plugins"
+bash tools/vendor-plugin.sh deps/TweakXL.dylib   "$APP/Contents/Resources/plugins/TweakXL"
+bash tools/vendor-plugin.sh deps/ArchiveXL.dylib "$APP/Contents/Resources/plugins/ArchiveXL"
 
 echo "==> bundling nctool mod engine (drag-drop installer)"
 # nctool is the cp2077 archive/mod engine. Publish it self-contained (multi-file: the single-file variant

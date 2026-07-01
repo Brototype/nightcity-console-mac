@@ -6,14 +6,14 @@ enum Const {
     static let appVersion = "1.4.0"
     static let supportedGameVersion = "2.3.1"
     static let defaultGame = "\(NSHomeDirectory())/Library/Application Support/Steam/steamapps/common/Cyberpunk 2077"
-    // Files copied from the app's Resources into <game>/red4ext/ on install.
+    // Files copied from the app's Resources into <game>/red4ext/ on install. config.ini is REQUIRED - RED4ext
+    // reads [plugins] enabled=true from it; without it no plugins load. cyberpunk2077_addresses.json is its
+    // AddressLib. (TweakXL + ArchiveXL ship as vendored plugin DIRS - deployed separately, see install().)
     static let payload = ["red4ext_hooks.js", "FridaGadget.config", "RED4ext.dylib",
-                          "FridaGadget.dylib", "libcyberconsole_overlay.dylib", "cet_catalog.tsv"]
-    // CyberModMan creator payload: (bundled Resource name, destination relative to gamePath).
-    // TweakXL is a RED4ext plugin (loaded from plugins/, not DYLD-injected); the names file is
-    // user data once they start creating, so it is seeded only when absent (never overwritten).
+                          "FridaGadget.dylib", "libcyberconsole_overlay.dylib", "cet_catalog.tsv",
+                          "config.ini", "cyberpunk2077_addresses.json"]
+    // The names file is user data once they start creating, so it is seeded only when absent (never overwritten).
     static let cmnPayload: [(res: String, dest: String, seedOnly: Bool)] = [
-        ("TweakXL.dylib",           "red4ext/plugins/TweakXL/TweakXL.dylib", false),
         ("cybermodman_names.json",  "red4ext/cybermodman_names.json",        true),
     ]
     static let repo = "ysrdevs/nightcity-console-mac"
@@ -63,7 +63,8 @@ final class Model: ObservableObject {
         let fm = FileManager.default
         let core = Const.payload.allSatisfy { fm.fileExists(atPath: "\(red4Dir)/\($0)") }
         let tweakXL = fm.fileExists(atPath: "\(gamePath)/red4ext/plugins/TweakXL/TweakXL.dylib")
-        return core && tweakXL
+        let archiveXL = fm.fileExists(atPath: "\(gamePath)/red4ext/plugins/ArchiveXL/ArchiveXL.dylib")
+        return core && tweakXL && archiveXL
     }
 
     func setGamePath(_ p: String) {
@@ -145,7 +146,7 @@ final class Model: ObservableObject {
                 if fm.fileExists(atPath: dst.path) { try fm.removeItem(at: dst) }
                 try fm.copyItem(at: src, to: dst)
             }
-            // CyberModMan creator payload (TweakXL plugin into plugins/, seed names file)
+            // CyberModMan creator payload (seed names file)
             for item in Const.cmnPayload {
                 let src = res.appendingPathComponent(item.res)
                 guard fm.fileExists(atPath: src.path) else { status = "Missing bundled file: \(item.res)"; return }
@@ -156,7 +157,20 @@ final class Model: ObservableObject {
                 if fm.fileExists(atPath: dstPath) { try fm.removeItem(at: dst) }
                 try fm.copyItem(at: src, to: dst)
             }
-            stripQuarantine(red4Dir)   // files we just wrote (incl. plugins/TweakXL) -> make dyld load them
+            // Vendored RED4ext plugins (TweakXL + ArchiveXL) - each is a self-contained folder (plugin dylib +
+            // its Homebrew spdlog/fmt/yaml-cpp deps rebound to @loader_path). Deploy the whole folder so the
+            // plugins load on a Mac with no Homebrew (the reason mods failed on a fresh machine).
+            let pluginsSrc = res.appendingPathComponent("plugins")
+            if let names = try? fm.contentsOfDirectory(atPath: pluginsSrc.path) {
+                for name in names where !name.hasPrefix(".") {
+                    let src = pluginsSrc.appendingPathComponent(name)
+                    let dstPath = "\(gamePath)/red4ext/plugins/\(name)"
+                    try fm.createDirectory(atPath: "\(gamePath)/red4ext/plugins", withIntermediateDirectories: true)
+                    if fm.fileExists(atPath: dstPath) { try fm.removeItem(atPath: dstPath) }
+                    try fm.copyItem(at: src, to: URL(fileURLWithPath: dstPath))
+                }
+            }
+            stripQuarantine(red4Dir)   // files we just wrote (incl. plugins/*) -> make dyld load them
             guard ensureGameEntitlements() else { return }   // status set on failure
             status = "Installed - click Play."
             refresh()

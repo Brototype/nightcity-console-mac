@@ -17,11 +17,14 @@ if [ -d "$GAME" ]; then
   echo "Found local install - copying from: $GAME"
   copy_if "$GAME/RED4ext.dylib"
   copy_if "$GAME/FridaGadget.dylib"
-  copy_if "$GAME/plugins/TweakXL/TweakXL.dylib"   # CyberModMan creator weapon engine (RED4ext plugin)
+  copy_if "$GAME/plugins/TweakXL/TweakXL.dylib"       # TweakXL creator engine (RED4ext plugin)
+  copy_if "$GAME/plugins/ArchiveXL/ArchiveXL.dylib"   # ArchiveXL content engine (RED4ext plugin) - REQUIRED for mods
+  copy_if "$GAME/config.ini"                          # RED4ext config ([plugins] enabled=true) - without it no plugins load
+  copy_if "$GAME/cyberpunk2077_addresses.json"        # RED4ext AddressLib
 fi
 
 MISSING=0
-for f in RED4ext.dylib FridaGadget.dylib TweakXL.dylib; do
+for f in RED4ext.dylib FridaGadget.dylib TweakXL.dylib ArchiveXL.dylib config.ini; do
   [ -f "deps/$f" ] || { echo "  MISSING: deps/$f"; MISSING=1; }
 done
 
