@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 enum Const {
     static let appVersion = "1.4.0"
@@ -74,6 +75,7 @@ final class Model: ObservableObject {
     func refresh() {
         gameVersion = readGameVersion()
         installed = fullyInstalled()
+        refreshMods()
         if !gameFound {
             status = "Cyberpunk 2077 not found here - click Browse to locate it."
         } else {
@@ -286,6 +288,95 @@ final class Model: ObservableObject {
             status = "Launch failed: \(error.localizedDescription)"
         }
     }
+
+    // MARK: - Mod management (drag-drop installer, powered by the bundled `nctool` engine)
+
+    struct InstalledMod: Identifiable {
+        let id = UUID()
+        let name: String
+        let manifestPath: String
+        let fileCount: Int
+    }
+    @Published var mods: [InstalledMod] = []
+
+    // Per-mod manifests (name + the exact deployed files) live here so uninstall is precise.
+    var modsManifestDir: String { "\(gamePath)/red4ext/nightcity/mods" }
+
+    // The bundled self-contained `nctool` CLI (the archive/mod engine). In the shipped app it sits in
+    // Resources; a dev override lets us test before bundling.
+    func nctoolPath() -> String? {
+        if let res = Bundle.main.resourceURL {
+            let p = res.appendingPathComponent("nctool").path
+            if FileManager.default.isExecutableFile(atPath: p) { return p }
+        }
+        if let dev = ProcessInfo.processInfo.environment["NIGHTCITY_NCTOOL"],
+           FileManager.default.isExecutableFile(atPath: dev) { return dev }
+        return nil
+    }
+
+    @discardableResult
+    func runNctool(_ args: [String]) -> (ok: Bool, out: String) {
+        guard let tool = nctoolPath() else { return (false, "nctool helper not found.") }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: tool)
+        p.arguments = args
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
+        do { try p.run() } catch { return (false, "Could not run nctool: \(error.localizedDescription)") }
+        // Read before waiting so a large output can't deadlock the pipe.
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return (p.terminationStatus == 0, String(data: data, encoding: .utf8) ?? "")
+    }
+
+    func refreshMods() {
+        let fm = FileManager.default
+        var found: [InstalledMod] = []
+        if let items = try? fm.contentsOfDirectory(atPath: modsManifestDir) {
+            for f in items where f.hasSuffix(".json") {
+                let mp = "\(modsManifestDir)/\(f)"
+                guard let data = fm.contents(atPath: mp),
+                      let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { continue }
+                let name = (obj["name"] as? String) ?? (f as NSString).deletingPathExtension
+                let files = (obj["files"] as? [String]) ?? []
+                found.append(InstalledMod(name: name, manifestPath: mp, fileCount: files.count))
+            }
+        }
+        mods = found.sorted { $0.name.lowercased() < $1.name.lowercased() }
+    }
+
+    // Install a dragged/picked mod (.zip or folder): nctool deploys it (+ writes a manifest), then we
+    // regenerate the handoffs from ALL installed mods.
+    func installMod(from url: URL) {
+        guard gameFound else { status = "Game not found."; return }
+        guard fullyInstalled() else { status = "Install NightCity Console first, then add mods."; return }
+        guard nctoolPath() != nil else { status = "nctool helper missing from the app bundle."; return }
+        let base = url.deletingPathExtension().lastPathComponent
+        let manifest = "\(modsManifestDir)/\(base).json"
+        status = "Installing \(base)…"
+        let r = runNctool(["install", url.path, gamePath, manifest])
+        guard r.ok else { status = "Couldn't install \(base): \(lastLine(r.out))"; return }
+        let g = runNctool(["regen", gamePath])
+        refreshMods()
+        status = g.ok ? "Installed \(base) · click Play." : "Installed \(base) (handoff warning: \(lastLine(g.out)))"
+    }
+
+    // Uninstall: delete every file the manifest recorded, drop the manifest, regen the handoffs.
+    func removeMod(_ mod: InstalledMod) {
+        let fm = FileManager.default
+        if let data = fm.contents(atPath: mod.manifestPath),
+           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           let files = obj["files"] as? [String] {
+            for f in files where fm.fileExists(atPath: f) { try? fm.removeItem(atPath: f) }
+        }
+        try? fm.removeItem(atPath: mod.manifestPath)
+        runNctool(["regen", gamePath])
+        refreshMods()
+        status = "Removed \(mod.name)."
+    }
+
+    private func lastLine(_ s: String) -> String {
+        s.split(whereSeparator: \.isNewline).last.map(String.init) ?? s
+    }
 }
 
 struct ContentView: View {
@@ -372,6 +463,15 @@ struct ContentView: View {
                 }
             }
 
+            Divider()
+            HStack {
+                Text("MODS").font(.caption2).foregroundColor(.secondary)
+                Spacer()
+                Button("Add Mod…") { addMod() }.disabled(!m.installed)
+            }
+            modDropZone
+            modsList
+
             Spacer()
             HStack {
                 Text(m.status).font(.callout).foregroundColor(.secondary)
@@ -384,7 +484,71 @@ struct ContentView: View {
             Text("Single-player only · back up your saves").font(.caption2).foregroundColor(.secondary)
         }
         .padding(22)
-        .frame(width: 600, height: 380)
+        .frame(width: 620, height: 640)
+    }
+
+    // Dashed drop target: drag a mod .zip or folder onto it to install.
+    var modDropZone: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [6]))
+                .foregroundColor(.secondary.opacity(0.5))
+            VStack(spacing: 3) {
+                Image(systemName: "tray.and.arrow.down").font(.title3).foregroundColor(.secondary)
+                Text("Drag a mod .zip or folder here").font(.callout).foregroundColor(.secondary)
+                Text(m.installed ? "or click Add Mod above" : "install NightCity Console first")
+                    .font(.caption2).foregroundColor(.secondary)
+            }
+        }
+        .frame(height: 70)
+        .onDrop(of: [UTType.fileURL], isTargeted: nil) { providers in handleDrop(providers) }
+    }
+
+    @ViewBuilder var modsList: some View {
+        if m.mods.isEmpty {
+            Text("No mods installed yet.").font(.caption).foregroundColor(.secondary)
+        } else {
+            ScrollView {
+                VStack(spacing: 1) {
+                    ForEach(m.mods) { mod in
+                        HStack(spacing: 8) {
+                            Image(systemName: "shippingbox.fill").foregroundColor(.secondary).font(.caption)
+                            Text(mod.name).font(.callout)
+                            Text("\(mod.fileCount) files").font(.caption2).foregroundColor(.secondary)
+                            Spacer()
+                            Button { m.removeMod(mod) } label: { Image(systemName: "trash") }
+                                .buttonStyle(.borderless).foregroundColor(.red)
+                                .help("Remove \(mod.name)")
+                        }
+                        .padding(.horizontal, 6).padding(.vertical, 3)
+                    }
+                }
+            }
+            .frame(maxHeight: 130)
+        }
+    }
+
+    func addMod() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Add"
+        panel.message = "Select a mod .zip or mod folder"
+        if panel.runModal() == .OK { for url in panel.urls { m.installMod(from: url) } }
+    }
+
+    // Resolve dropped file URLs and install each. Returns true if any provider was a file URL.
+    func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        var accepted = false
+        for provider in providers where provider.canLoadObject(ofClass: URL.self) {
+            accepted = true
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url = url, url.isFileURL else { return }
+                DispatchQueue.main.async { m.installMod(from: url) }
+            }
+        }
+        return accepted
     }
 
     func browse() {
