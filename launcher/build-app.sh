@@ -28,17 +28,20 @@ cp build/libcyberconsole_overlay.dylib                  "$APP/Contents/Resources
 cp deps/TweakXL.dylib runtime/cybermodman/cybermodman_names.json "$APP/Contents/Resources/"
 
 echo "==> bundling nctool mod engine (drag-drop installer)"
-# nctool is the cp2077 archive/mod engine. Publish it self-contained (single-file) so the shipped app needs
-# no dotnet at runtime; the launcher shells out to Resources/nctool. Set NCTOOL_SRC to override the location.
+# nctool is the cp2077 archive/mod engine. Publish it self-contained (multi-file: the single-file variant
+# tucks libkraken into a lib/ subfolder the runtime can't find) so the shipped app needs no dotnet; the
+# launcher shells out to Resources/nctool/nctool. Set NCTOOL_SRC to override the location.
 NCTOOL_SRC="${NCTOOL_SRC:-$HOME/cp2077/_tools/nctool}"
 if [ -d "$NCTOOL_SRC" ]; then
   DOTNET="$(command -v dotnet || echo "$HOME/.dotnet/dotnet")"
+  rm -rf build/nctool-pub
   "$DOTNET" publish "$NCTOOL_SRC" -c Release -r osx-arm64 --self-contained true \
-    -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true \
-    -o build/nctool-pub >/dev/null
-  # macOS needs only the exe + the mac Kraken native (the .dll/.so are Windows/Linux, skip them).
-  cp build/nctool-pub/nctool build/nctool-pub/libkraken.dylib "$APP/Contents/Resources/"
-  echo "  bundled nctool + libkraken.dylib"
+    -p:PublishSingleFile=false -o build/nctool-pub >/dev/null
+  rm -f build/nctool-pub/*.pdb
+  # Bundle the whole self-contained publish (exe + .NET runtime + libkraken.dylib) into Resources/nctool/.
+  rm -rf "$APP/Contents/Resources/nctool"
+  ditto build/nctool-pub "$APP/Contents/Resources/nctool"
+  echo "  bundled nctool self-contained ($(ls "$APP/Contents/Resources/nctool" | wc -l | tr -d ' ') files)"
 else
   echo "  [warn] nctool source not found at $NCTOOL_SRC - the mod installer will show 'helper missing'."
   echo "         Set NCTOOL_SRC=/path/to/cp2077/_tools/nctool and rebuild to enable drag-drop mod install."

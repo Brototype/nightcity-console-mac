@@ -308,7 +308,7 @@ final class Model: ObservableObject {
     // Resources; a dev override lets us test before bundling.
     func nctoolPath() -> String? {
         if let res = Bundle.main.resourceURL {
-            let p = res.appendingPathComponent("nctool").path
+            let p = res.appendingPathComponent("nctool/nctool").path   // self-contained publish dir
             if FileManager.default.isExecutableFile(atPath: p) { return p }
         }
         if let dev = ProcessInfo.processInfo.environment["NIGHTCITY_NCTOOL"],
