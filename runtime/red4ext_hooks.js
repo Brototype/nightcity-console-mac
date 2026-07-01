@@ -1770,6 +1770,57 @@ try { cmnLog('=== cybermodman custom-names init ==='); cmnLoad(); cmnInstall(); 
     }catch(e){ rlog('attach err '+e); }
 })();
 
+// installMeshRedirect (gate 3, the @dynamic garment mesh-load fix): an ArchiveXL @dynamic garment component stores
+// a DYNAMIC mesh path template, e.g. "*base\nd_base\mesh\nd_top_mila_{gender}_{body}.mesh". On macOS the ArchiveXL
+// C++ expansion can't fire (the engine garment ABIs/structs differ from the Windows SDK at every hook we tried),
+// so the engine loads the RAW template string -> ResourceToken fails -> null mesh -> GarmentAssembler crash. FIX
+// (register-level, upstream of every ABI wall, the FXRESEAL pattern for meshes): the engine resource-token cache
+// lookup FUN_1021b4d58 takes the ResourcePath hash as a PLAIN u64 in x1 BEFORE any token binding; swap the dynamic
+// mesh-path hash -> the expanded LITERAL hash there, so the engine streams the real mesh. Both hashes are computed
+// with the engine's own ResourcePath::Create (0x21c90a4) from /tmp/cp2077_xl_meshalias.txt ("<template>\t<expanded>"
+// per @dynamic mesh, produced offline by `archdump | _tools/mkmeshalias.py`). ABI-free, general for any dynamic mod.
+(function installMeshRedirect(){
+    var LOG='/tmp/cp2077_factoryindex.log';
+    function mlog(s){ try{ var f=new File(LOG,'a'); f.write(s+'\n'); f.flush(); f.close(); }catch(e){} try{console.log('[MESHRDR] '+s);}catch(e){} }
+    var base; try{base=getModuleBase();}catch(e){base=null;}
+    if(!base){ mlog('no base'); return; }
+
+    var fnRP=null, fnDepot=null;
+    try{ fnRP=new NativeFunction(base.add(0x21c90a4),'uint64',['pointer','uint32']); }catch(e){ mlog('fnRP ctor err '+e); }
+    try{ fnDepot=new NativeFunction(base.add(0x21c4d44),'pointer',['uint64']); }catch(e){ mlog('fnDepot ctor err '+e); }
+    if(!fnRP){ mlog('no fnRP - abort'); return; }
+    function hx(u){ return '0x'+u.toString(16); }   // matches NativePointer.toString() (lowercase, no leading zero)
+
+    // ALIAS: dynHashHex -> litPtr. Create does NOT strip '*','{','}' (only quotes/slashes) -> dynHash is stable.
+    var ALIAS={}, n=0;
+    try{
+        var t=File.readAllText('/tmp/cp2077_xl_meshalias.txt');
+        if(t) t.split('\n').forEach(function(line){
+            line=line.replace(/\r$/,'').trim(); if(!line||line[0]==='#') return;
+            var parts=line.split('\t'); if(parts.length<2) return;
+            var tmpl=parts[0].trim(), exp=parts[1].trim(); if(!tmpl||!exp) return;
+            var dyn=fnRP(Memory.allocUtf8String(tmpl), tmpl.length);
+            var lit=fnRP(Memory.allocUtf8String(exp), exp.length);
+            var dynHex=hx(dyn), litHex=hx(lit);
+            var present=true;
+            try{ if(fnDepot){ present=!fnDepot(lit).isNull(); } }catch(e){}
+            if(!present){ mlog('SKIP "'+exp+'" '+litHex+' ABSENT in depot (literal mesh not in a loaded archive?)'); return; }
+            ALIAS[dynHex]=ptr(litHex); n++;
+            mlog('alias "'+tmpl+'" '+dynHex+' -> "'+exp+'" '+litHex+' (depot: present)');
+        });
+    }catch(e){ mlog('read alias err '+e); }
+    if(n===0){ mlog('no aliases - redirect not installed'); return; }
+
+    // Swap x1 (ResourcePath hash) at the resource-token cache lookup, before token binding.
+    var swaps=0;
+    try{
+        Interceptor.attach(base.add(0x21b4d58), { onEnter:function(a){
+            try{ var lit=ALIAS[a[1].toString()]; if(lit){ if(swaps<25){ swaps++; mlog('SWAP #'+swaps+' '+a[1].toString()+' -> '+lit); } a[1]=lit; } }catch(e){}
+        }});
+        mlog('installed mesh redirect @ base+0x21b4d58 ('+n+' alias(es))');
+    }catch(e){ mlog('attach redirect err '+e); }
+})();
+
 // ===== W^X keystone: live trampoline-page fix + diagnostic =====
 // The @dynamic garment path crashes when an ArchiveXL HookAfter (OnResolveSuffixes / OnLoadMaterials)
 // calls the ORIGINAL through a frida-gum 'original' trampoline: a red engine WORKER thread executes it
@@ -1818,8 +1869,14 @@ try { cmnLog('=== cybermodman custom-names init ==='); cmnLoad(); cmnInstall(); 
 // hooks), the gadget must NOT also hook them: its Frida redirect overwrites the prologue, so RED4ext's
 // manual hook reads a branch (PC-relative) and falls back to the broken gum path. false = RED4ext owns
 // 0xcb12bc / 0x3710004 / 0xae6660; the gadget skips them.
-var CET_OWNS_GARMENT = true;   // true = gadget owns the appearance path (bikini literal force works). Set FALSE
-                               // ONLY for the @dynamic Garment-gate experiment (RED4ext manual hooks own it then).
+var CET_OWNS_GARMENT = true;   // true = gadget owns the appearance path (bikini literal force works).
+                               // ONLY false for the @dynamic Garment-gate experiment (RED4ext manual hooks own it then).
+// Ownership is launch-flag driven so we never have to hand-edit/redeploy this file per mode: if the flag
+// file /tmp/cp2077_red4ext_owns_garment exists (created by launch_red4ext_dynamic.sh, removed by the
+// normal launch_red4ext.sh), RED4ext owns the Garment fns and the gadget steps aside. Default stays true
+// (the bikini literal path) when the flag is absent. readAllText throws if the file is missing -> stays true.
+try { File.readAllText('/tmp/cp2077_red4ext_owns_garment'); CET_OWNS_GARMENT = false; } catch(e) {}
+try { console.log('[GARMENT-OWNER] ' + (CET_OWNS_GARMENT ? 'CET gadget (bikini literal)' : 'RED4ext manual hooks (@dynamic)')); } catch(e) {}
 (function installAppearanceProbe(){
     if(!CET_OWNS_GARMENT){ try{console.log('[APPRPROBE] disabled (RED4ext owns the appearance path)');}catch(e){} return; }
     var LOG='/tmp/cp2077_appearance.log';
