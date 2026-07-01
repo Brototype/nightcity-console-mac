@@ -30,8 +30,18 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <algorithm>
+#include <cstdint>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 #include "imgui.h"
 #include "backends/imgui_impl_metal.h"
+// PUC-Lua 5.1.5 (interpreter-only, no JIT, W^X-safe). C headers, so wrap for ObjC++.
+// This is the runtime that will host CET-style Lua mods (Q6 bring-up).
+extern "C" {
+#include "lua.h"
+#include "lualib.h"
+#include "lauxlib.h"
+}
 
 // ---- logging ----
 static void olog(const char* fmt, ...) {
@@ -136,12 +146,352 @@ static void submitCommand(const char* c) {
     olog("submitted: %s", c);
 }
 static void appendOut(const char* s) { FILE* f = fopen(OUT_PATH, "a"); if (f) { fprintf(f, "%s\n", s); fclose(f); } }
+// ============================================================================
+// Native MINI-CET (Q12 foundation): resolve + call engine functions directly in-process,
+// no /tmp round-trip. Keystone for non-blocking Game.* (including inside onDraw). Ported from
+// the Frida MINI-CET in red4ext_hooks.js. Staged bring-up: this proves native resolution + a
+// no-arg call from the render thread (same thread onDraw uses, so success here means onDraw can
+// call the engine too). Arg marshalling + the full Game proxy come next.
+// ============================================================================
+typedef uint64_t (*NccExecFn)(void* fn, void* ctx, void* frame, void* result, void* retType);
+typedef void*    (*NccRegGetter)();
+typedef void*    (*NccGetClassFn)(void* reg, uint64_t nameHash);
+
+static uint64_t nccFnv1a64(const char* s){ uint64_t h=0xCBF29CE484222325ULL; for(;*s;++s){ h^=(uint64_t)(uint8_t)*s; h*=0x100000001b3ULL; } return h; }
+
+// Main game executable load address (the MH_EXECUTE image). Offsets like 0x2173120 add to this.
+// Selecting by Mach-O filetype (not a fixed dyld index) is the robust form of the old index bug.
+static uintptr_t nccGameBase(){
+    static uintptr_t base = 0;
+    if (base) return base;
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++){
+        const struct mach_header* h = _dyld_get_image_header(i);
+        if (h && h->filetype == MH_EXECUTE){ base = (uintptr_t)h; break; }
+    }
+    return base;
+}
+
+static void* g_nccReg = nullptr; static NccGetClassFn g_nccGetClass = nullptr;
+static void nccEnsureReg(){
+    if (g_nccReg) return;
+    uintptr_t base = nccGameBase(); if (!base) return;
+    NccRegGetter getter = (NccRegGetter)(base + 0x2188e8c);   // CRTTISystem::Get
+    g_nccReg = getter(); if (!g_nccReg) return;
+    void* vt = *(void**)g_nccReg;                              // registry vtable
+    g_nccGetClass = *(NccGetClassFn*)((uintptr_t)vt + 0x10);   // GetClass @ vt+0x10
+}
+static void* nccClsByName(const char* n){ nccEnsureReg(); if(!g_nccGetClass) return nullptr; return g_nccGetClass(g_nccReg, nccFnv1a64(n)); }
+
+struct NccFn { void* fn; void* retType; bool isStatic; };
+// Walk the class chain; check instance funcs (CClass+0x48) then static funcs (+0x58); match fn+0x10 == fnv(method).
+static bool nccResolveFunc(const char* className, const char* method, NccFn* out){
+    void* cls = nccClsByName(className); if(!cls) return false;
+    uint64_t mh = nccFnv1a64(method);
+    while (cls){
+        const uintptr_t offs[2] = {0x48, 0x58};
+        for (int oi=0; oi<2; oi++){
+            void* fp = *(void**)((uintptr_t)cls + offs[oi]);
+            uint32_t cnt = *(uint32_t*)((uintptr_t)cls + offs[oi] + 8);
+            if (fp) for (uint32_t i=0; i<cnt; i++){
+                void* f = *(void**)((uintptr_t)fp + i*8); if(!f) continue;
+                if (*(uint64_t*)((uintptr_t)f + 0x10) == mh){
+                    void* rp = *(void**)((uintptr_t)f + 0x18);
+                    out->fn = f; out->retType = rp ? *(void**)rp : nullptr; out->isStatic = (oi==1);
+                    return true;
+                }
+            }
+        }
+        cls = *(void**)((uintptr_t)cls + 0x10);                // parent class
+    }
+    return false;
+}
+static void nccHexDump(const char* label, const void* p, int n){
+    if(!p){ appendOut((std::string(label)+" = (null)").c_str()); return; }
+    std::string s = label; s += " = ";
+    const uint8_t* b = (const uint8_t*)p; char h[4];
+    for(int i=0;i<n;i++){ snprintf(h,sizeof(h),"%02x ", b[i]); s += h; }
+    appendOut(s.c_str());
+}
+// No-arg invoke: minimal frame (just ParamEnd) + executor call. result16 = 16-byte out buffer.
+// Heap-allocated (16-byte aligned, like Frida Memory.alloc) to match the working hooks.js path.
+// Returns the executor's own return code (for diagnostics).
+static uint64_t nccCallNoArg(void* fn, void* ctx, void* retType, uint8_t* result16){
+    NccExecFn Exec = (NccExecFn)(nccGameBase() + 0x2173120);
+    uint8_t* bc = (uint8_t*)calloc(1, 64); if(bc) bc[0]=0x26;  // ParamEnd
+    uint8_t* locals = (uint8_t*)calloc(1, 0x40);
+    uint8_t* frame  = (uint8_t*)calloc(1, 0x90);
+    if(frame){ *(void**)(frame+0x00)=bc; *(void**)(frame+0x10)=locals; *(void**)(frame+0x18)=locals; *(void**)(frame+0x40)=ctx; }
+    memset(result16,0,16);
+    uint64_t rc = Exec(fn, ctx, frame, result16, retType);
+    nccHexDump("  locals[0:0x20] post", locals, 0x20);
+    nccHexDump("  frame[0:0x20] post", frame, 0x20);
+    free(bc); free(locals); free(frame);
+    return rc;
+}
+// Fetch a LIVE player handle via the Q7 bridge right before a native call (avoids the stale-handle gap).
+static uint64_t nccBridgeGetPlayer(){
+    static unsigned bseq = 1000000;
+    unsigned seq = ++bseq;
+    { FILE* f=fopen("/tmp/cp2077_lreq.txt","w"); if(!f) return 0; fprintf(f,"%u\tGetPlayer\t0\n",seq); fclose(f); }
+    for(int t=0;t<80;t++){ usleep(5000);   // ~400ms cap: this runs on the render thread, only once (GI is cached after)
+        FILE* r=fopen("/tmp/cp2077_lres.txt","r"); if(!r) continue;
+        char line[4096]; uint64_t val=0; bool got=false;
+        while(fgets(line,sizeof(line),r)){ char* t1=strchr(line,'\t'); if(!t1)continue; char* t2=strchr(t1+1,'\t'); if(!t2)continue; *t1=0; *t2=0;
+            if((unsigned)strtoul(line,nullptr,10)!=seq) continue;
+            if(strncmp(t1+1,"ptr",3)==0||strncmp(t1+1,"int",3)==0) val=strtoull(t2+1,nullptr,0); got=true; break; }
+        fclose(r); if(got) return val;
+    }
+    return 0;
+}
+// ---- arg marshalling (Q12 step 1): ported 1:1 from callFunc() in red4ext_hooks.js ----
+// Param-type name hashes (the GetName hash of each param's type meta); from the T_* consts in hooks.js.
+static const uint64_t NCC_T_I32  = 0xb9a127f5b4a621bfULL, NCC_T_U32 = 0x3d2e9dd9e3c28d8cULL;
+static const uint64_t NCC_T_I64  = 0xb9902ff5b497bc24ULL, NCC_T_U64 = 0x3d3f99d9e3d0f9f3ULL;
+static const uint64_t NCC_T_F32  = 0xb64f4a0accc8a8c5ULL, NCC_T_BOOL= 0xf7bdd5a7c820889dULL;
+static const uint64_t NCC_T_CNAME= 0xa5e23de2a2657af9ULL, NCC_T_TDB = 0x4072151ff3dcf7bcULL;
+static const uint64_t NCC_T_ITEM = 0xd15b2274885d7f7dULL;
+// refcnt sentinel a handle's second word points at (matches Memory.alloc(8)+writeU32(0x100000)x2 in hooks.js).
+static uint32_t g_nccRefcnt[2] = { 0x100000, 0x100000 };
+
+static uint32_t nccCrc32(const char* s){ uint32_t crc=0xFFFFFFFFu; for(;*s;++s){ uint32_t c=(crc^(uint8_t)*s)&0xFFu; for(int k=0;k<8;k++) c=(c&1)?(0xEDB88320u^(c>>1)):(c>>1); crc=(crc>>8)^c; } return crc^0xFFFFFFFFu; }
+// type meta -> its name hash (instance vtable +0x10 = GetName), mirrors nameOf() in hooks.js.
+typedef uint64_t (*NccGetNameFn)(void* obj);
+static uint64_t nccTypeName(void* type){ if(!type) return 0; void* vt=*(void**)type; if(!vt) return 0; NccGetNameFn fn=*(NccGetNameFn*)((uintptr_t)vt+0x10); return fn?fn(type):0; }
+
+// Marshal string args by the function's declared param types and invoke the executor in-process.
+// Arg forms: "@player"/"@self" -> the ctx handle; "@0x..." -> an explicit handle ptr; otherwise a scalar
+// parsed by the param type. result16 = 16-byte out buffer. Returns the executor rc; on a marshalling
+// error returns 0 and fills *err. gameItemID (T_ITEM) is not yet ported (still goes via the bridge).
+static uint64_t nccCall(const NccFn* f, void* ctx, int argc, const char** argv, uint8_t* result16, std::string* err){
+    NccExecFn Exec = (NccExecFn)(nccGameBase() + 0x2173120);
+    void* pEntries = *(void**)((uintptr_t)f->fn + 0x28);
+    uint32_t pCount = *(uint32_t*)((uintptr_t)f->fn + 0x30);
+    uint8_t* locals = (uint8_t*)calloc(1, 0x40 + (size_t)argc*0x20);
+    std::vector<void*> props;
+    auto fail = [&](const std::string& m)->uint64_t{ if(err)*err=m; for(void* cp:props) free(cp); free(locals); return 0; };
+    for(int i=0;i<argc;i++){
+        if((uint32_t)i >= pCount) return fail("too many args (fn takes "+std::to_string(pCount)+")");
+        void* prop  = *(void**)((uintptr_t)pEntries + i*8);
+        void* ptype = *(void**)prop;                 // prop.readPointer()
+        uint64_t tn = nccTypeName(ptype);
+        size_t off  = 0x20 + (size_t)i*0x20;
+        uint8_t* dst = locals + off;
+        const char* a = argv[i];
+        if (a[0]=='@'){
+            void* inst = (strcmp(a,"@player")==0||strcmp(a,"@self")==0) ? ctx : (void*)strtoull(a+1,nullptr,0);
+            if(!inst) return fail(std::string("no instance for ")+a);
+            *(void**)dst = inst; *(void**)(dst+8) = g_nccRefcnt;          // handle = {inst, refcnt}
+        }
+        else if (tn==NCC_T_I32 || tn==NCC_T_U32){ *(uint32_t*)dst = (uint32_t)strtoul(a,nullptr,0); }
+        else if (tn==NCC_T_I64 || tn==NCC_T_U64){ *(uint64_t*)dst = (uint64_t)strtoull(a,nullptr,0); }
+        else if (tn==NCC_T_F32){ *(float*)dst = strtof(a,nullptr); }
+        else if (tn==NCC_T_BOOL){ *(uint8_t*)dst = (strcmp(a,"true")==0||strcmp(a,"1")==0)?1:0; }
+        else if (tn==NCC_T_CNAME){ *(uint64_t*)dst = nccFnv1a64(a); }
+        else if (tn==NCC_T_TDB){ uint32_t h=nccCrc32(a); dst[0]=h&0xff; dst[1]=(h>>8)&0xff; dst[2]=(h>>16)&0xff; dst[3]=(h>>24)&0xff; dst[4]=(uint8_t)strlen(a); dst[5]=dst[6]=dst[7]=0; }
+        else if (tn==NCC_T_ITEM){ return fail("gameItemID arg not yet native (use the bridge for GiveItem)"); }
+        else { // enum or other: accept a plain integer literal, else unsupported
+            char* endp=nullptr; unsigned long long v=strtoull(a,&endp,0);
+            if(endp && *endp==0){ *(uint64_t*)dst = v; }
+            else { char hb[24]; snprintf(hb,sizeof(hb),"0x%llx",(unsigned long long)tn); return fail(std::string("unsupported arg type ")+hb+" for \""+a+"\""); }
+        }
+        uint8_t* cp = (uint8_t*)calloc(1,0x30); *(void**)cp = ptype; *(uint32_t*)(cp+0x20) = (uint32_t)off;
+        props.push_back(cp);
+    }
+    uint8_t* bc = (uint8_t*)calloc(1, 16 + (size_t)argc*9);
+    size_t o=0; for(int i=0;i<argc;i++){ bc[o++]=0x18; *(void**)(bc+o)=props[i]; o+=8; } bc[o]=0x26; // ParamEnd
+    uint8_t* frame = (uint8_t*)calloc(1, 0x90);
+    *(void**)(frame+0x00)=bc; *(void**)(frame+0x10)=locals; *(void**)(frame+0x18)=locals; *(void**)(frame+0x40)=ctx;
+    memset(result16,0,16);
+    uint64_t rc = Exec(f->fn, ctx, frame, result16, f->retType);
+    for(void* cp:props) free(cp); free(bc); free(locals); free(frame);
+    return rc;
+}
+
+// ---- raw-item marshaller (Q12 step 2): ported from callFuncRaw() in red4ext_hooks.js ----
+// For in-code call chains where args are pre-encoded values (handles, raw buffers, scalars) rather
+// than strings. Needed for the native handle chain (GameInstance is passed as a raw buffer).
+enum { NCC_HANDLE, NCC_RAW, NCC_I32, NCC_U64 };
+struct NccItem { int kind; void* inst; const void* raw; int n; uint64_t v; };
+static uint64_t nccCallRaw(const NccFn* f, void* ctx, const std::vector<NccItem>& items, uint8_t* result16){
+    NccExecFn Exec = (NccExecFn)(nccGameBase() + 0x2173120);
+    void* pEntries = *(void**)((uintptr_t)f->fn + 0x28);
+    uint8_t* locals = (uint8_t*)calloc(1, 0x40 + items.size()*0x20);
+    std::vector<void*> props;
+    for(size_t i=0;i<items.size();i++){
+        void* prop  = *(void**)((uintptr_t)pEntries + i*8);
+        void* ptype = *(void**)prop;
+        size_t off  = 0x20 + i*0x20; uint8_t* dst = locals + off;
+        const NccItem& it = items[i];
+        if(it.kind==NCC_HANDLE){ *(void**)dst = it.inst; *(void**)(dst+8) = g_nccRefcnt; }
+        else if(it.kind==NCC_RAW){ memcpy(dst, it.raw, it.n); }
+        else if(it.kind==NCC_I32){ *(uint32_t*)dst = (uint32_t)it.v; }
+        else if(it.kind==NCC_U64){ *(uint64_t*)dst = it.v; }
+        uint8_t* cp = (uint8_t*)calloc(1,0x30); *(void**)cp = ptype; *(uint32_t*)(cp+0x20) = (uint32_t)off; props.push_back(cp);
+    }
+    uint8_t* bc = (uint8_t*)calloc(1, 16 + items.size()*9);
+    size_t o=0; for(size_t i=0;i<items.size();i++){ bc[o++]=0x18; *(void**)(bc+o)=props[i]; o+=8; } bc[o]=0x26;
+    uint8_t* frame = (uint8_t*)calloc(1, 0x90);
+    *(void**)(frame+0x00)=bc; *(void**)(frame+0x10)=locals; *(void**)(frame+0x18)=locals; *(void**)(frame+0x40)=ctx;
+    memset(result16,0,16);
+    uint64_t rc = Exec(f->fn, ctx, frame, result16, f->retType);
+    for(void* cp:props) free(cp); free(bc); free(locals); free(frame);
+    return rc;
+}
+static bool nccSane(void* p){ uintptr_t v=(uintptr_t)p; return v>0x10000ULL && v<0x800000000000ULL; }
+// A usable engine object: sane pointer whose vtable is also a sane pointer. Rejects null and the common
+// stale/freed case (zeroed vtable). MUST gate every instance call so a bad ctx never reaches the executor
+// (a null/garbage ctx makes the executor dereference it and hard-crash, which Lua pcall cannot catch).
+static bool nccValidObject(void* p){ return nccSane(p) && nccSane(*(void**)p); }
+static bool nccResolveAny(const char* const* classes, int nc, const char* method, NccFn* out){
+    for(int i=0;i<nc;i++) if(nccResolveFunc(classes[i], method, out)) return true;
+    return false;
+}
+// Live-player resolution (mirrors getGI -> getViaGetter('GetPlayerSystem') -> GetLocalPlayer* in hooks.js).
+// Bootstraps from the bridge player each call, walks to the GameInstance, then resolves the authoritative
+// local player NATIVELY so the returned handle is always live (never a stale snapshot). `vb` logs each stage.
+// CRITICAL: GetPlayerSystem must be called with the PLAYER (boot) as ctx - the proven path. Passing the
+// GameInstance pointer as ctx makes the executor virtual-dispatch on the wrong object and crashes the game.
+static void* g_nccLastPlayer = nullptr;
+static void* nccGetLivePlayer(bool vb){
+    char b[160];
+    void* boot = (void*)nccBridgeGetPlayer();
+    if(!nccValidObject(boot)){ if(vb) appendOut("  [chain] bridge bootstrap player invalid (not in game?)"); g_nccLastPlayer=nullptr; return nullptr; }
+    // 1. PlayerPuppet.GetGame(player) -> GameInstance wrapper (16B in the result buffer)
+    NccFn gg; if(!nccResolveFunc("PlayerPuppet","GetGame",&gg)){ if(vb) appendOut("  [chain] PlayerPuppet.GetGame NOT FOUND"); return nullptr; }
+    uint8_t gi[16]; nccCallRaw(&gg, boot, {}, gi);
+    if(vb){ snprintf(b,sizeof(b),"  [chain] GetGame -> gi[0:8]=0x%llx gi[8:16]=0x%llx",(unsigned long long)*(uint64_t*)gi,(unsigned long long)*(uint64_t*)(gi+8)); appendOut(b); }
+    // 2. GameInstance.GetPlayerSystem(gi) -> player system; try gi as 8 then 16 bytes. ctx = the player (boot).
+    const char* giClasses[] = {"ScriptGameInstance","GameInstance","gameScriptGameInstance"};
+    NccFn gps; if(!nccResolveAny(giClasses,3,"GetPlayerSystem",&gps)){ if(vb) appendOut("  [chain] GetPlayerSystem NOT FOUND"); return nullptr; }
+    void* ps=nullptr; uint8_t r[16];
+    for(int nb : {8,16}){ std::vector<NccItem> it = {{ NCC_RAW, nullptr, gi, nb, 0 }}; nccCallRaw(&gps, boot, it, r); void* p=*(void**)r;
+        if(vb){ snprintf(b,sizeof(b),"  [chain] GetPlayerSystem(gi%d) -> %p",nb,p); appendOut(b); }
+        if(nccSane(p)){ ps=p; break; } }
+    if(!ps){ if(vb) appendOut("  [chain] no player system"); return nullptr; }
+    // 3. <playerSystem>.GetLocalPlayer*() -> live local player game object
+    const char* psClasses[] = {"gamePlayerSystem","cpPlayerSystem","PlayerSystem"};
+    const char* getters[]   = {"GetLocalPlayerControlledGameObject","GetLocalPlayerMainGameObject","GetLocalPlayer","GetPlayerControlledGameObject"};
+    for(const char* c : psClasses) for(const char* g : getters){
+        NccFn m; if(!nccResolveFunc(c,g,&m)) continue;
+        uint8_t rr[16]; nccCallRaw(&m, ps, {}, rr); void* lp=*(void**)rr;
+        if(vb){ snprintf(b,sizeof(b),"  [chain] %s.%s -> %p",c,g,lp); appendOut(b); }
+        if(nccSane(lp)){ g_nccLastPlayer=lp; return lp; }
+    }
+    if(vb) appendOut("  [chain] no local-player getter yielded a sane handle (not in game?)");
+    g_nccLastPlayer=nullptr;
+    return nullptr;
+}
+// Player accessor for console/mod calls. Re-resolves natively each call (one bridge bootstrap per call).
+static void* nccCachedPlayer(){ return nccGetLivePlayer(false); }
+// RENDER-PATH player accessor (safe to call every frame from onDraw). Reuses the cached handle while it is
+// still a valid object (cheap, NO bridge); only runs the full chain when the handle goes invalid (first call
+// + after a reload/respawn), and backs off when not in game so a menu never hammers the blocking bridge.
+static void* nccRenderPlayer(){
+    static int cooldown = 0;
+    if(nccValidObject(g_nccLastPlayer)) return g_nccLastPlayer;   // valid cached handle -> reuse, no /tmp
+    if(cooldown > 0){ cooldown--; return nullptr; }
+    void* p = nccGetLivePlayer(false);                            // resolve (one bridge bootstrap)
+    if(!p) cooldown = 120;                                        // not in game: ~2s before retrying the bridge
+    return p;
+}
+// Push an executor 16-byte result onto the Lua stack typed by the function's return type. Returns the
+// number of Lua values pushed (0 for void). Vector3/Vector4 expand to 3/4 numbers (CET-style).
+static int nccPushResult(lua_State* L, void* retType, const uint8_t* res){
+    if(!retType) return 0;                                   // void
+    uint64_t tn = nccTypeName(retType);
+    if(tn==NCC_T_BOOL){ lua_pushboolean(L, res[0]!=0); return 1; }
+    if(tn==NCC_T_F32){  lua_pushnumber(L, *(const float*)res); return 1; }
+    if(tn==NCC_T_I32){  lua_pushnumber(L, *(const int32_t*)res); return 1; }
+    if(tn==NCC_T_U32){  lua_pushnumber(L, *(const uint32_t*)res); return 1; }
+    if(tn==nccFnv1a64("Vector4")){ const float* v=(const float*)res; lua_pushnumber(L,v[0]); lua_pushnumber(L,v[1]); lua_pushnumber(L,v[2]); lua_pushnumber(L,v[3]); return 4; }
+    if(tn==nccFnv1a64("Vector3")){ const float* v=(const float*)res; lua_pushnumber(L,v[0]); lua_pushnumber(L,v[1]); lua_pushnumber(L,v[2]); return 3; }
+    lua_pushnumber(L, (lua_Number)*(const uint64_t*)res); return 1;   // ptr / int64 / cname / handle
+}
+// Console: liveplayer -> run the native handle chain verbosely and sanity-call GetEntityID on the result.
+// Also compares against the bridge player through the SAME nccCallRaw path to isolate object-vs-callpath.
+static void luaLivePlayerCmd(){
+    char b[200];
+    NccFn ge; bool haveGe = nccResolveFunc("gameObject","GetEntityID",&ge);
+    appendOut("liveplayer: resolving local player natively...");
+    void* lp = nccGetLivePlayer(true);
+    static const char* posClasses[] = {"gameObject","gameEntity"};
+    NccFn gw; bool haveGw = nccResolveAny(posClasses,2,"GetWorldPosition",&gw);
+    if(lp){
+        snprintf(b,sizeof(b),"liveplayer NATIVE handle = %p  vtable=0x%llx",lp,(unsigned long long)*(uint64_t*)lp); appendOut(b);
+        if(haveGe){ uint8_t r[16]; nccCallRaw(&ge, lp, {}, r);
+            snprintf(b,sizeof(b),"  GetEntityID(native handle) = 0x%llx",(unsigned long long)*(uint64_t*)r); appendOut(b); }
+        if(haveGw){ uint8_t r[16]; nccCallRaw(&gw, lp, {}, r); float* v=(float*)r;
+            snprintf(b,sizeof(b),"  GetWorldPosition(native) = (%.2f, %.2f, %.2f, %.2f)  <- real coords = real player",v[0],v[1],v[2],v[3]); appendOut(b); }
+    } else appendOut("liveplayer: native chain FAILED");
+    // ---- control: the known-good bridge player, called through the identical path ----
+    void* bp = (void*)nccBridgeGetPlayer();
+    if(nccSane(bp)){
+        snprintf(b,sizeof(b),"  [control] bridge player = %p  vtable=0x%llx",bp,(unsigned long long)*(uint64_t*)bp); appendOut(b);
+        if(haveGe){ uint8_t r[16]; nccCallRaw(&ge, bp, {}, r);
+            snprintf(b,sizeof(b),"  [control] GetEntityID(bridge player via nccCallRaw) = 0x%llx",(unsigned long long)*(uint64_t*)r); appendOut(b); }
+    } else appendOut("  [control] bridge player not sane");
+}
+
+// Console: luacall <Class> <Method> <player|ctxHex|0> [args...] -> resolve + marshal string args + call.
+// ctx "player" fetches a fresh live handle via the bridge; "0"/"-" passes null (for static fns).
+static void luaCallCmd(const char* argline){
+    std::vector<std::string> tk; { char* dup=strdup(argline); for(char* t=strtok(dup," \t"); t; t=strtok(nullptr," \t")) tk.push_back(t); free(dup); }
+    if(tk.size()<3){ appendOut("usage: luacall <Class> <Method> <player|ctxHex|0> [args...]"); return; }
+    NccFn rf;
+    if(!nccResolveFunc(tk[0].c_str(), tk[1].c_str(), &rf)){ appendOut((tk[0]+"."+tk[1]+" NOT FOUND").c_str()); return; }
+    void* ctx = (tk[2]=="player") ? (void*)nccBridgeGetPlayer()
+              : (tk[2]=="live")   ? nccGetLivePlayer(false)   // never-stale native handle
+              : (tk[2]=="0"||tk[2]=="-") ? nullptr
+              : (void*)strtoull(tk[2].c_str(),nullptr,0);
+    std::vector<const char*> argv; for(size_t i=3;i<tk.size();i++) argv.push_back(tk[i].c_str());
+    char buf[256];
+    snprintf(buf,sizeof(buf),"luacall resolved %s.%s -> fn=%p retType=%p static=%d ctx=%p, %d args",
+             tk[0].c_str(),tk[1].c_str(),rf.fn,rf.retType,(int)rf.isStatic,ctx,(int)argv.size());
+    appendOut(buf);
+    uint8_t res[16]; std::string err;
+    uint64_t rc = nccCall(&rf, ctx, (int)argv.size(), argv.empty()?nullptr:argv.data(), res, &err);
+    if(!err.empty()){ appendOut((std::string("luacall error: ")+err).c_str()); return; }
+    snprintf(buf,sizeof(buf),"luacall %s.%s -> rc=0x%llx result[0:8]=0x%llx result[8:16]=0x%llx",
+             tk[0].c_str(),tk[1].c_str(),(unsigned long long)rc,
+             (unsigned long long)(*(uint64_t*)res),(unsigned long long)(*(uint64_t*)(res+8)));
+    appendOut(buf);
+}
+
+// Console: luanative <Class> <Method> [ctxHex|player] -> resolve natively, and call no-arg if a ctx is given.
+// Use the literal "player" for ctx to fetch a fresh live handle just before the call.
+static void luaNativeTest(const char* args){
+    char cls[160]={0}, meth[160]={0}, ctxs[64]={0};
+    int got = sscanf(args, "%159s %159s %63s", cls, meth, ctxs);
+    if (got < 2){ appendOut("usage: luanative <Class> <Method> [ctxHex]"); return; }
+    NccFn rf;
+    if (!nccResolveFunc(cls, meth, &rf)){ appendOut((std::string("luanative: ")+cls+"."+meth+" NOT FOUND").c_str()); return; }
+    char buf[256];
+    snprintf(buf, sizeof(buf), "luanative resolved %s.%s -> fn=%p retType=%p static=%d", cls, meth, rf.fn, rf.retType, (int)rf.isStatic);
+    appendOut(buf);
+    if (got >= 3){
+        void* ctx = (strcmp(ctxs, "player") == 0) ? (void*)nccBridgeGetPlayer() : (void*)strtoull(ctxs, nullptr, 0);
+        nccHexDump("  ctx[0:16]", ctx, 16);
+        nccHexDump("  retType[0:16]", rf.retType, 16);
+        uint8_t res[16]; uint64_t rc = nccCallNoArg(rf.fn, ctx, rf.retType, res);
+        snprintf(buf, sizeof(buf), "luanative called %s.%s(ctx=%p) -> exec_rc=0x%llx result[0:8]=0x%llx result[8:16]=0x%llx",
+                 cls, meth, ctx, (unsigned long long)rc, (unsigned long long)(*(uint64_t*)res), (unsigned long long)(*(uint64_t*)(res+8)));
+        appendOut(buf);
+    }
+}
+
+static void luaRunExpr(const char* expr);   // Q7: defined with the Lua runtime below
+static std::string overlayDir();            // defined below; used by loadLuaMods (Q8)
 
 // Handle a submitted line. `clear`/`help` are local to the overlay; everything else goes to Frida.
 static void handleSubmit(const char* cmd) {
     if (strcmp(cmd, "clear") == 0) { FILE* f = fopen(OUT_PATH, "w"); if (f) fclose(f); g_lines.clear(); return; }
     if (strcmp(cmd, "reload") == 0) { g_tabsDirty = true; appendOut("> reload"); appendOut("reloading tabs/ ..."); refreshOut(); return; }
     appendOut((std::string("> ") + cmd).c_str());
+    if (strncmp(cmd, "lua ", 4) == 0) { luaRunExpr(cmd + 4); refreshOut(); return; }   // Q7: run Lua in-process
+    if (strncmp(cmd, "luanative ", 10) == 0) { luaNativeTest(cmd + 10); refreshOut(); return; }   // Q12: native executor de-risk
+    if (strncmp(cmd, "luacall ", 8) == 0) { luaCallCmd(cmd + 8); refreshOut(); return; }            // Q12 step 1: native call WITH args
+    if (strcmp(cmd, "liveplayer") == 0) { luaLivePlayerCmd(); refreshOut(); return; }                 // Q12 step 2: native live-player chain
     if (strcmp(cmd, "help") == 0) {
         appendOut("items:  give <Items.X> <qty> | removeitem <Items.X> <qty> | money <n>");
         appendOut("        CET style: Game.AddToInventory(\"Items.X\", n)");
@@ -253,6 +603,227 @@ static void clip_set(ImGuiContext*, const char* text) {
     if (text) [pb setString:[NSString stringWithUTF8String:text] forType:NSPasteboardTypeString];
 }
 
+// ============================================================================
+// Lua runtime (PUC-Lua 5.1.5, interpreter-only) + the Game.* call bridge (Q6/Q7).
+//   g_L is the persistent VM. `print` is redirected to the console. `Game.<method>(...)`
+//   routes a request over a synchronous /tmp channel to hooks.js (which owns the RTTI
+//   executor / callFunc) and returns the result, so Lua can call engine functions.
+//   Q8 will add ImGui bindings + onDraw on top of this.
+// ============================================================================
+static lua_State* g_L = nullptr;
+static unsigned g_luaSeq = 0;
+static const char* LREQ_PATH = "/tmp/cp2077_lreq.txt";   // overlay -> hooks.js (Game call request)
+static const char* LRES_PATH = "/tmp/cp2077_lres.txt";   // hooks.js -> overlay (result, seq-matched)
+
+// print(...) -> the in-game console (Lua's stdout isn't visible in-game).
+static int l_print(lua_State* L) {
+    std::string out; int n = lua_gettop(L);
+    for (int i = 1; i <= n; i++) {
+        const char* s = lua_tostring(L, i);
+        if (!s) s = lua_typename(L, lua_type(L, i));
+        if (i > 1) out += "\t";
+        out += (s ? s : "?");
+    }
+    appendOut(out.c_str());
+    return 0;
+}
+
+// Game.<method>(args...). Native fast paths (non-blocking, safe in onDraw) are handled first; anything not
+// yet ported falls back to the /tmp bridge -> hooks.js callFunc (blocking <=1.5s).
+static int l_gameCall(lua_State* L) {
+    const char* method = lua_tostring(L, lua_upvalueindex(1));
+    if (!method) return luaL_error(L, "Game call: missing method name");
+    // --- native fast path: the local player handle (the most common Game call) ---
+    if (!strcmp(method,"GetPlayer") || !strcmp(method,"GetPlayerControlledGameObject") ||
+        !strcmp(method,"GetLocalPlayerControlledGameObject")) {
+        void* p = nccCachedPlayer();
+        if (nccValidObject(p)) lua_pushnumber(L, (lua_Number)(uintptr_t)p); else lua_pushnil(L);
+        return 1;
+    }
+    int nargs = lua_gettop(L);
+    unsigned seq = ++g_luaSeq;
+    std::string req = std::to_string(seq) + "\t" + method + "\t" + std::to_string(nargs);
+    for (int i = 1; i <= nargs; i++) { const char* a = lua_tostring(L, i); req += "\t"; req += (a ? a : ""); }
+    { FILE* f = fopen(LREQ_PATH, "w"); if (!f) return luaL_error(L, "Game.%s: cannot write request", method);
+      fprintf(f, "%s\n", req.c_str()); fclose(f); }
+    char type[32] = {0}; std::string value; bool got = false;
+    for (int tries = 0; tries < 300 && !got; tries++) {      // 300 * 5ms = 1.5s timeout
+        usleep(5000);
+        FILE* r = fopen(LRES_PATH, "r"); if (!r) continue;
+        char line[8192];
+        while (fgets(line, sizeof(line), r)) {
+            char* t1 = strchr(line, '\t'); if (!t1) continue;
+            char* t2 = strchr(t1 + 1, '\t'); if (!t2) continue;
+            *t1 = 0; *t2 = 0;
+            if ((unsigned)strtoul(line, nullptr, 10) != seq) continue;
+            strncpy(type, t1 + 1, sizeof(type) - 1);
+            value = t2 + 1;
+            size_t vn = value.size(); if (vn && value[vn-1] == '\n') value.erase(vn-1);
+            got = true; break;
+        }
+        fclose(r);
+    }
+    if (!got) return luaL_error(L, "Game.%s: no response (hooks.js down, or not in-game?)", method);
+    if (!strcmp(type, "ptr") || !strcmp(type, "int")) { lua_pushnumber(L, (lua_Number)strtoull(value.c_str(), nullptr, 0)); return 1; }
+    if (!strcmp(type, "str"))  { lua_pushstring(L, value.c_str()); return 1; }
+    if (!strcmp(type, "bool")) { lua_pushboolean(L, value == "true" || value == "1"); return 1; }
+    if (!strcmp(type, "nil"))  { lua_pushnil(L); return 1; }
+    if (!strcmp(type, "err"))  { return luaL_error(L, "Game.%s: %s", method, value.c_str()); }
+    lua_pushnil(L); return 1;
+}
+// Game.<key> -> a closure bound to <key> that performs the bridged call.
+static int l_game_index(lua_State* L) {
+    lua_pushvalue(L, 2);                       // key (method name) becomes the closure upvalue
+    lua_pushcclosure(L, l_gameCall, 1);
+    return 1;
+}
+// nativeCall(class, method, ctx, ...args) -> typed result. ctx: "player" (native live handle), nil (static
+// fn), or a number (raw object pointer). Args are marshalled by the function's declared param types. FULLY
+// NATIVE: no /tmp, safe to call every frame from onDraw. Vector3/Vector4 returns expand to 3/4 numbers.
+static int l_nativeCall(lua_State* L){
+    const char* cls  = luaL_checkstring(L,1);
+    const char* meth = luaL_checkstring(L,2);
+    NccFn rf; if(!nccResolveFunc(cls,meth,&rf)) return luaL_error(L, "nativeCall: %s.%s not found", cls, meth);
+    void* ctx;
+    if(lua_isnoneornil(L,3)) ctx=nullptr;
+    else if(lua_type(L,3)==LUA_TSTRING && !strcmp(lua_tostring(L,3),"player")) ctx=nccCachedPlayer();
+    else ctx=(void*)(uintptr_t)lua_tonumber(L,3);
+    // An instance method with a bad ctx would make the executor dereference garbage and HARD-crash (not a
+    // catchable Lua error). Refuse here so mods can pcall it safely (e.g. when not in game / at a menu).
+    if(!rf.isStatic && !nccValidObject(ctx)) return luaL_error(L, "nativeCall %s.%s: no valid object (not in game?)", cls, meth);
+    int top=lua_gettop(L);
+    std::vector<std::string> sargs; for(int i=4;i<=top;i++){ const char* s=lua_tostring(L,i); sargs.push_back(s?s:""); }
+    std::vector<const char*> argv; for(auto& s:sargs) argv.push_back(s.c_str());
+    uint8_t res[16]; std::string err;
+    nccCall(&rf, ctx, (int)argv.size(), argv.empty()?nullptr:argv.data(), res, &err);
+    if(!err.empty()) return luaL_error(L, "nativeCall %s.%s: %s", cls, meth, err.c_str());
+    return nccPushResult(L, rf.retType, res);
+}
+// Game.playerPos() -> x, y, z  (3 numbers), or nil if not in game.
+// RENDER-SAFE: this is meant for onDraw, so it NEVER raises a Lua error (no luaL_error / longjmp, which
+// would corrupt the ImGui frame). On any failure it returns nil and the mod just checks `if x then`.
+static int l_playerPos(lua_State* L){
+    void* p = nccRenderPlayer();
+    if(!nccValidObject(p)){ lua_pushnil(L); return 1; }
+    static NccFn gw; static bool resolved=false, ok=false;
+    if(!resolved){ const char* cls[]={"gameObject","gameEntity"}; ok=nccResolveAny(cls,2,"GetWorldPosition",&gw); resolved=true; }
+    if(!ok){ lua_pushnil(L); return 1; }
+    uint8_t r[16]; nccCallRaw(&gw, p, {}, r); const float* v=(const float*)r;
+    lua_pushnumber(L,v[0]); lua_pushnumber(L,v[1]); lua_pushnumber(L,v[2]); return 3;
+}
+
+// ---- ImGui bindings for Lua (Q8): native + in-overlay, no channel, run at full framerate ----
+static int g_igBeginDepth = 0;   // outstanding ImGui::Begin (each needs an End; unwound if a mod errors)
+static int ig_Begin(lua_State* L){ const char* n=luaL_checkstring(L,1); bool open=true, r;
+    if(lua_gettop(L)>=2 && !lua_isnil(L,2)){ open=lua_toboolean(L,2); r=ImGui::Begin(n,&open); } else { r=ImGui::Begin(n); }
+    g_igBeginDepth++; lua_pushboolean(L,r); lua_pushboolean(L,open); return 2; }
+static int ig_End(lua_State* L){ if(g_igBeginDepth>0){ ImGui::End(); g_igBeginDepth--; } return 0; }
+static int ig_Text(lua_State* L){ ImGui::TextUnformatted(luaL_checkstring(L,1)); return 0; }
+static int ig_TextColored(lua_State* L){ float r=(float)luaL_checknumber(L,1),g=(float)luaL_checknumber(L,2),b=(float)luaL_checknumber(L,3),a=(float)luaL_optnumber(L,4,1.0); ImGui::TextColored(ImVec4(r,g,b,a),"%s",luaL_checkstring(L,5)); return 0; }
+static int ig_TextWrapped(lua_State* L){ ImGui::TextWrapped("%s",luaL_checkstring(L,1)); return 0; }
+static int ig_Button(lua_State* L){ const char* lbl=luaL_checkstring(L,1); float w=(float)luaL_optnumber(L,2,0),h=(float)luaL_optnumber(L,3,0); lua_pushboolean(L,ImGui::Button(lbl,ImVec2(w,h))); return 1; }
+static int ig_SmallButton(lua_State* L){ lua_pushboolean(L,ImGui::SmallButton(luaL_checkstring(L,1))); return 1; }
+static int ig_Separator(lua_State* L){ ImGui::Separator(); return 0; }
+static int ig_SameLine(lua_State* L){ ImGui::SameLine((float)luaL_optnumber(L,1,0)); return 0; }
+static int ig_Spacing(lua_State* L){ ImGui::Spacing(); return 0; }
+static int ig_Checkbox(lua_State* L){ const char* lbl=luaL_checkstring(L,1); bool v=lua_toboolean(L,2); bool c=ImGui::Checkbox(lbl,&v); lua_pushboolean(L,c); lua_pushboolean(L,v); return 2; }
+static int ig_SliderInt(lua_State* L){ const char* lbl=luaL_checkstring(L,1); int v=(int)luaL_checknumber(L,2),mn=(int)luaL_checknumber(L,3),mx=(int)luaL_checknumber(L,4); bool c=ImGui::SliderInt(lbl,&v,mn,mx); lua_pushboolean(L,c); lua_pushnumber(L,v); return 2; }
+static int ig_InputText(lua_State* L){ const char* lbl=luaL_checkstring(L,1); const char* cur=luaL_optstring(L,2,""); char buf[1024]; strncpy(buf,cur,sizeof(buf)-1); buf[sizeof(buf)-1]=0; bool c=ImGui::InputText(lbl,buf,sizeof(buf)); lua_pushboolean(L,c); lua_pushstring(L,buf); return 2; }
+static int ig_SetNextWindowSize(lua_State* L){ ImGui::SetNextWindowSize(ImVec2((float)luaL_checknumber(L,1),(float)luaL_checknumber(L,2)), ImGuiCond_FirstUseEver); return 0; }
+
+// registerForEvent("onDraw", fn): append fn to the onDraw registry (Q8 supports onDraw only).
+static int l_registerForEvent(lua_State* L){
+    const char* ev=luaL_checkstring(L,1); luaL_checktype(L,2,LUA_TFUNCTION);
+    if(strcmp(ev,"onDraw")!=0) return 0;
+    lua_getfield(L, LUA_REGISTRYINDEX, "ncc_onDraw");
+    if(!lua_istable(L,-1)){ lua_pop(L,1); lua_newtable(L); lua_pushvalue(L,-1); lua_setfield(L, LUA_REGISTRYINDEX, "ncc_onDraw"); }
+    int n=(int)lua_objlen(L,-1);
+    lua_pushvalue(L,2); lua_rawseti(L,-2,n+1);
+    lua_pop(L,1);
+    return 0;
+}
+// Called every frame (inside the ImGui frame, when the overlay is shown). Each callback is pcall-wrapped,
+// and any ImGui windows it left open (error or sloppy mod) are unwound so the frame stays balanced.
+static void luaRunOnDraw(){
+    if(!g_L) return;
+    lua_getfield(g_L, LUA_REGISTRYINDEX, "ncc_onDraw");
+    if(!lua_istable(g_L,-1)){ lua_pop(g_L,1); return; }
+    int n=(int)lua_objlen(g_L,-1);
+    for(int i=1;i<=n;i++){
+        lua_rawgeti(g_L,-1,i);
+        int depth0=g_igBeginDepth;
+        if(lua_pcall(g_L,0,0,0)!=0){ appendOut((std::string("lua onDraw error: ")+lua_tostring(g_L,-1)).c_str()); lua_pop(g_L,1); }
+        while(g_igBeginDepth>depth0){ ImGui::End(); g_igBeginDepth--; }
+    }
+    lua_pop(g_L,1);
+}
+// Load every overlayDir()/mods/<name>/init.lua (each calls registerForEvent to hook onDraw).
+static void loadLuaMods(){
+    if(!g_L) return;
+    std::string dir = overlayDir() + "/mods";
+    DIR* d = opendir(dir.c_str());
+    if(!d){ olog("Lua: no mods dir at %s", dir.c_str()); return; }
+    int loaded=0; struct dirent* e;
+    while((e=readdir(d))!=nullptr){
+        std::string name=e->d_name; if(name.empty()||name[0]=='.') continue;
+        std::string init=dir+"/"+name+"/init.lua"; struct stat st; if(stat(init.c_str(),&st)!=0) continue;
+        if(luaL_dofile(g_L, init.c_str())!=0){ const char* err=lua_tostring(g_L,-1); olog("Lua mod '%s' error: %s", name.c_str(), err?err:"?"); lua_pop(g_L,1); }
+        else { loaded++; olog("Lua mod loaded: %s", name.c_str()); }
+    }
+    closedir(d);
+    olog("Lua: %d mod(s) loaded from %s", loaded, dir.c_str());
+}
+
+static void initLua() {
+    if (g_L) return;
+    g_L = luaL_newstate();
+    if (!g_L) { olog("Lua: luaL_newstate failed (out of memory?)"); return; }
+    luaL_openlibs(g_L);                        // base, string, table, math, os, io, debug
+    lua_pushcfunction(g_L, l_print); lua_setglobal(g_L, "print");
+    lua_pushcfunction(g_L, l_registerForEvent); lua_setglobal(g_L, "registerForEvent");
+    lua_pushcfunction(g_L, l_nativeCall); lua_setglobal(g_L, "nativeCall");   // Q12: non-blocking native engine call
+    lua_newtable(g_L);                         // Game
+    lua_newtable(g_L);                         // metatable
+    lua_pushcfunction(g_L, l_game_index); lua_setfield(g_L, -2, "__index");
+    lua_setmetatable(g_L, -2);
+    lua_pushcfunction(g_L, l_playerPos); lua_setfield(g_L, -2, "playerPos");   // render-safe: returns nil, never errors
+    lua_setglobal(g_L, "Game");
+    lua_newtable(g_L);                         // ImGui
+#define IGREG(nm,fn) do{ lua_pushcfunction(g_L,fn); lua_setfield(g_L,-2,nm); }while(0)
+    IGREG("Begin",ig_Begin); IGREG("End",ig_End); IGREG("Text",ig_Text); IGREG("TextColored",ig_TextColored);
+    IGREG("TextWrapped",ig_TextWrapped); IGREG("Button",ig_Button); IGREG("SmallButton",ig_SmallButton);
+    IGREG("Separator",ig_Separator); IGREG("SameLine",ig_SameLine); IGREG("Spacing",ig_Spacing);
+    IGREG("Checkbox",ig_Checkbox); IGREG("SliderInt",ig_SliderInt); IGREG("InputText",ig_InputText);
+    IGREG("SetNextWindowSize",ig_SetNextWindowSize);
+#undef IGREG
+    lua_setglobal(g_L, "ImGui");
+    if (luaL_dostring(g_L, "return _VERSION") == 0) {
+        const char* v = lua_tostring(g_L, -1);
+        olog("Lua initialized: %s + Game bridge + ImGui bindings", v ? v : "(unknown)");
+        lua_pop(g_L, 1);
+    } else { olog("Lua: smoke test failed: %s", lua_tostring(g_L, -1)); lua_pop(g_L, 1); }
+    loadLuaMods();
+}
+
+// Run a console `lua <expr>` line: try as an expression (return ...) first, else as statements.
+static void luaRunExpr(const char* expr) {
+    if (!g_L) { appendOut("lua: VM not initialized (open the console once after launch)"); return; }
+    int base0 = lua_gettop(g_L);
+    std::string asRet = std::string("return ") + expr;
+    if (luaL_loadstring(g_L, asRet.c_str()) != 0) {       // not an expression
+        lua_pop(g_L, 1);
+        if (luaL_loadstring(g_L, expr) != 0) { appendOut((std::string("lua error: ") + lua_tostring(g_L, -1)).c_str()); lua_settop(g_L, base0); return; }
+    }
+    if (lua_pcall(g_L, 0, LUA_MULTRET, 0) != 0) { appendOut((std::string("lua error: ") + lua_tostring(g_L, -1)).c_str()); lua_settop(g_L, base0); return; }
+    if (lua_gettop(g_L) - base0 <= 0) { appendOut("lua: ok"); return; }
+    for (int i = base0 + 1; i <= lua_gettop(g_L); i++) {
+        const char* s = lua_tostring(g_L, i);
+        if (!s) s = lua_typename(g_L, lua_type(g_L, i));
+        appendOut((std::string("= ") + (s ? s : "?")).c_str());
+    }
+    lua_settop(g_L, base0);
+}
+
 static void initImGui(id<MTLDevice> dev) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -269,6 +840,7 @@ static void initImGui(id<MTLDevice> dev) {
     refreshOut();
     g_imguiInit = true;
     olog("ImGui %s initialized", IMGUI_VERSION);
+    initLua();   // Q6: stand up the Lua runtime alongside ImGui
 }
 
 // Up/Down arrow command history for the input box.
@@ -1191,7 +1763,7 @@ static void renderOverlay(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable)
 
     ImGui_ImplMetal_NewFrame(rpd);
     ImGui::NewFrame();
-    if (g_show.load()) drawConsole();
+    if (g_show.load()) { drawConsole(); luaRunOnDraw(); }   // Q8: Lua mods draw their own windows
     ImGui::Render();
 
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
@@ -1201,6 +1773,11 @@ static void renderOverlay(id<MTLCommandBuffer> cb, id<CAMetalDrawable> drawable)
 }
 
 static void runRender(id self, id drawable) {
+    // Perf: nothing is drawn when the console is closed (drawConsole()/luaRunOnDraw() are g_show-gated), yet
+    // compositing an empty ImGui pass every frame still re-loads+stores the whole framebuffer (loadAction=Load)
+    // and serializes against the game's GPU work - measured ~40-60ms/frame at 4K with the console CLOSED. Skip
+    // the whole pass when closed; the present hook stays installed so backtick still opens it instantly.
+    if (!g_show.load()) return;
     @autoreleasepool {
         @try { renderOverlay((id<MTLCommandBuffer>)self, (id<CAMetalDrawable>)drawable); }
         @catch (NSException* e) { olog("render exception: %s", [[e reason] UTF8String]); }
