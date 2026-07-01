@@ -67,40 +67,18 @@ rm -f "$ZIP"
 # 2) .dmg with an /Applications shortcut + drag-here layout, then notarize + staple
 #    the dmg itself so the downloaded image also passes Gatekeeper offline.
 rm -f "$DMG"
-VOL="NightCity Console"; STAGE="build/dmg"; RWDMG="dist/_rw.dmg"; APPNAME="$(basename "$APP")"
+VOL="NightCity Console"; STAGE="build/dmg"; APPNAME="$(basename "$APP")"
+# Pre-clean any stale mounts left by an interrupted prior run (they pile up as "NightCity Console 1/2/..."
+# and make the old hdiutil convert fail with "Resource temporarily unavailable").
+for v in /Volumes/"$VOL"*; do [ -d "$v" ] && hdiutil detach "$v" -force >/dev/null 2>&1 || true; done
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 ditto "$APP" "$STAGE/$APPNAME"
-ln -s /Applications "$STAGE/Applications"            # the shortcut users drag into
-rm -f "$RWDMG"
-hdiutil create -volname "$VOL" -srcfolder "$STAGE" -fs HFS+ -format UDRW -ov "$RWDMG"
-MNT="/Volumes/$VOL"
-hdiutil attach "$RWDMG" -nobrowse -noverify -noautoopen >/dev/null
-# Lay the window out as icon view: app on the left, Applications on the right, so it's
-# obvious you copy the app over. Non-fatal if Finder automation is unavailable - the
-# Applications shortcut alone still conveys it.
-osascript <<EOF || echo "  (note: could not style dmg window; Applications shortcut is still present)"
-tell application "Finder"
-  tell disk "$VOL"
-    open
-    set current view of container window to icon view
-    set toolbar visible of container window to false
-    set statusbar visible of container window to false
-    set the bounds of container window to {200, 120, 760, 470}
-    set vopts to the icon view options of container window
-    set arrangement of vopts to not arranged
-    set icon size of vopts to 96
-    set text size of vopts to 12
-    set position of item "$APPNAME" of container window to {150, 200}
-    set position of item "Applications" of container window to {410, 200}
-    update without registering applications
-    delay 1
-    close
-  end tell
-end tell
-EOF
-sync; hdiutil detach "$MNT" >/dev/null || hdiutil detach "$MNT" -force >/dev/null
-hdiutil convert "$RWDMG" -format UDZO -o "$DMG" >/dev/null
-rm -f "$RWDMG"; rm -rf "$STAGE"
+ln -s /Applications "$STAGE/Applications"            # the drag-here shortcut
+# Create the compressed .dmg DIRECTLY from the staging folder - no attach/Finder-style/convert dance (that was
+# flaky on macOS 27's deprecated hdiutil and accumulated stale /Volumes mounts). Reliable; the Applications
+# shortcut conveys "drag the app here" (the fancy icon layout is dropped for a build that always succeeds).
+hdiutil create -volname "$VOL" -srcfolder "$STAGE" -format UDZO -ov "$DMG" >/dev/null
+rm -rf "$STAGE"
 xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
 xcrun stapler staple "$DMG"
 
