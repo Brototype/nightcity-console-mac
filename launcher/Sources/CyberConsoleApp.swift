@@ -64,7 +64,70 @@ final class Model: ObservableObject {
         let core = Const.payload.allSatisfy { fm.fileExists(atPath: "\(red4Dir)/\($0)") }
         let tweakXL = fm.fileExists(atPath: "\(gamePath)/red4ext/plugins/TweakXL/TweakXL.dylib")
         let archiveXL = fm.fileExists(atPath: "\(gamePath)/red4ext/plugins/ArchiveXL/ArchiveXL.dylib")
-        return core && tweakXL && archiveXL
+        // scc (the redscript compiler) is required only when the app bundle actually ships it, so old
+        // installs self-heal via play()'s install() call without bricking dev builds that lack it.
+        let scc = sccResourcePath() == nil || fm.fileExists(atPath: sccGamePath)
+        return core && tweakXL && archiveXL && scc
+    }
+
+    // MARK: - redscript (scc) integration
+
+    // The bundled redscript compiler (jac3km4/redscript, arm64). Deployed into the game's engine/tools/
+    // (the layout scc's cache/backup logic expects, same as Windows) and run from there.
+    var sccGameDir: String { "\(gamePath)/engine/tools" }
+    var sccGamePath: String { "\(sccGameDir)/scc" }
+    func sccResourcePath() -> URL? {
+        guard let res = Bundle.main.resourceURL else { return nil }
+        let d = res.appendingPathComponent("scc")
+        return FileManager.default.isExecutableFile(atPath: d.appendingPathComponent("scc").path) ? d : nil
+    }
+
+    // True when any redscript source is deployed (script mods put .reds under r6/scripts/<Mod>/).
+    func hasScripts() -> Bool {
+        guard let e = FileManager.default.enumerator(atPath: "\(gamePath)/r6/scripts") else { return false }
+        for case let f as String in e where f.hasSuffix(".reds") { return true }
+        return false
+    }
+
+    // Deploy scc + libscc_lib.dylib from the app bundle into <game>/engine/tools/.
+    private func deployScc() throws {
+        guard let src = sccResourcePath() else { return }   // not bundled (dev build) - skip quietly
+        let fm = FileManager.default
+        try fm.createDirectory(atPath: sccGameDir, withIntermediateDirectories: true)
+        for f in ["scc", "libscc_lib.dylib"] {
+            let s = src.appendingPathComponent(f)
+            guard fm.fileExists(atPath: s.path) else { continue }
+            let d = "\(sccGameDir)/\(f)"
+            if fm.fileExists(atPath: d) { try fm.removeItem(atPath: d) }
+            try fm.copyItem(at: s, to: URL(fileURLWithPath: d))
+            try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: d)
+        }
+        stripQuarantine(sccGameDir)
+    }
+
+    // Compile all deployed .reds (r6/scripts) into the game's script cache (r6/cache/final.redscripts)
+    // with the bundled redscript compiler. scc backs the vanilla cache up to final.redscripts.bk on first
+    // run and only overwrites the cache when compilation SUCCEEDS, so a broken script mod fail-opens to
+    // the previous good cache. A full compile takes ~0.3s. Returns nil on success, else a short error.
+    // MUST be called off the main thread.
+    private func compileScripts() -> String? {
+        let scriptsDir = "\(gamePath)/r6/scripts"
+        // Removing the last script mod may leave the dir empty/missing; compiling an empty dir is how
+        // the cache gets restored to base-only, so make sure the dir exists rather than skipping.
+        try? FileManager.default.createDirectory(atPath: scriptsDir, withIntermediateDirectories: true)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: sccGamePath)
+        p.arguments = ["-compile", scriptsDir]
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
+        do { try p.run() } catch { return "could not run scc: \(error.localizedDescription)" }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        let out = String(data: data, encoding: .utf8) ?? ""
+        guard p.terminationStatus == 0, out.contains("Output successfully saved") else {
+            let err = out.split(whereSeparator: \.isNewline).first { $0.contains("ERROR") }
+            return err.map(String.init) ?? lastLine(out)
+        }
+        return nil
     }
 
     func setGamePath(_ p: String) {
@@ -170,6 +233,7 @@ final class Model: ObservableObject {
                     try fm.copyItem(at: src, to: URL(fileURLWithPath: dstPath))
                 }
             }
+            try deployScc()            // redscript compiler -> <game>/engine/tools/ (script-mod support)
             stripQuarantine(red4Dir)   // files we just wrote (incl. plugins/*) -> make dyld load them
             guard ensureGameEntitlements() else { return }   // status set on failure
             status = "Installed - click Play."
@@ -289,21 +353,39 @@ final class Model: ObservableObject {
 
         // The mod handoffs live in /tmp, which macOS clears on reboot. If mods are installed but the handoff
         // is gone, regenerate it before launch so the game auto-loads the mods on this boot. Within a session
-        // (handoff already present, kept fresh by install/remove) this is skipped, so Play stays instant.
-        if nctoolPath() != nil && !mods.isEmpty && !fm.fileExists(atPath: "/tmp/cp2077_xl_items.txt") {
-            busy = true; progress = 0; busyDetail = "Preparing mods…"; status = "Preparing mods…"
+        // (handoff already present, kept fresh by install/remove) this is skipped.
+        let needRegen = nctoolPath() != nil && !mods.isEmpty && !fm.fileExists(atPath: "/tmp/cp2077_xl_items.txt")
+        // Script mods (.reds) must be recompiled into the game's script cache before launch; the cache is
+        // only read at game startup. A full scc compile is ~0.3s, so run it on every Play when scripts exist.
+        let needCompile = hasScripts() && fm.isExecutableFile(atPath: sccGamePath)
+        if needRegen || needCompile {
+            busy = true; progress = 0
+            busyDetail = needRegen ? "Preparing mods…" : "Compiling scripts…"
+            status = busyDetail
             DispatchQueue.global(qos: .userInitiated).async {
-                self.runNctoolStreaming(["regen", self.gamePath]) { line in
-                    if let p = self.parseProgress(line) {
-                        DispatchQueue.main.async {
-                            self.progress = p.frac
-                            self.busyDetail = (p.label.isEmpty ? "Preparing mods" : p.label) + "…"
+                if needRegen {
+                    self.runNctoolStreaming(["regen", self.gamePath]) { line in
+                        if let p = self.parseProgress(line) {
+                            DispatchQueue.main.async {
+                                self.progress = p.frac
+                                self.busyDetail = (p.label.isEmpty ? "Preparing mods" : p.label) + "…"
+                            }
                         }
                     }
+                }
+                var compileWarn: String? = nil
+                if needCompile {
+                    DispatchQueue.main.async { self.busyDetail = "Compiling scripts…" }
+                    compileWarn = self.compileScripts()
                 }
                 DispatchQueue.main.async {
                     self.busy = false; self.busyDetail = ""; self.progress = 0
                     self.launchGame()
+                    // scc keeps the previous good cache on failure, so the game still launches fine -
+                    // but tell the user their script mod didn't take.
+                    if let w = compileWarn {
+                        self.status = "Launched, but a script mod failed to compile (previous scripts kept): \(w)"
+                    }
                 }
             }
         } else {
@@ -476,11 +558,22 @@ final class Model: ObservableObject {
                     }
                 }
             }
+            // Phase 3: if any .reds are deployed (this mod or an earlier one), recompile the script cache
+            // so redscript mods are live on the next launch. ~0.3s.
+            var scriptWarn: String? = nil
+            if self.hasScripts() && FileManager.default.isExecutableFile(atPath: self.sccGamePath) {
+                DispatchQueue.main.async { self.progress = 0.99; self.busyDetail = "Compiling scripts…" }
+                scriptWarn = self.compileScripts()
+            }
             DispatchQueue.main.async {
                 self.busy = false; self.busyDetail = ""; self.progress = 0
                 self.refreshMods()
-                self.status = g.ok ? "Installed \(base) · click Play."
-                                   : "Installed \(base) (game-data warning: \(self.lastLine(g.out)))"
+                if let w = scriptWarn {
+                    self.status = "Installed \(base), but its scripts failed to compile (mod inactive): \(w)"
+                } else {
+                    self.status = g.ok ? "Installed \(base) · click Play."
+                                       : "Installed \(base) (game-data warning: \(self.lastLine(g.out)))"
+                }
             }
         }
     }
@@ -503,6 +596,12 @@ final class Model: ObservableObject {
                 if let p = self.parseProgress(line) {
                     DispatchQueue.main.async { self.progress = p.frac; if !p.label.isEmpty { self.busyDetail = p.label + "…" } }
                 }
+            }
+            // Recompile the script cache so a removed script mod actually leaves the game - the compiled
+            // cache would otherwise keep serving it. With zero script mods left this restores base scripts.
+            if FileManager.default.isExecutableFile(atPath: self.sccGamePath) {
+                DispatchQueue.main.async { self.busyDetail = "Compiling scripts…" }
+                _ = self.compileScripts()
             }
             DispatchQueue.main.async {
                 self.busy = false; self.busyDetail = ""; self.progress = 0

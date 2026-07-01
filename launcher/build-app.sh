@@ -56,6 +56,18 @@ else
   echo "         Set NCTOOL_SRC=/path/to/cp2077/_tools/nctool and rebuild to enable drag-drop mod install."
 fi
 
+echo "==> bundling redscript compiler (scc)"
+# jac3km4/redscript's scc (arm64) + its dylib. The launcher deploys them to <game>/engine/tools/ and
+# runs scc -compile before every launch so drag-dropped .reds script mods just work. Rust AOT binary:
+# no JIT entitlements needed; sign-notarize.sh's Resources Mach-O loop signs both automatically.
+mkdir -p "$APP/Contents/Resources/scc"
+if cp deps/scc deps/libscc_lib.dylib "$APP/Contents/Resources/scc/" 2>/dev/null; then
+  chmod +x "$APP/Contents/Resources/scc/scc"
+  echo "  bundled scc + libscc_lib.dylib"
+else
+  echo "  [warn] scc missing from deps/ (re-run tools/fetch-deps.sh) - script mods won't compile"
+fi
+
 if [ -f assets/icon.png ]; then
   echo "==> generating app icon (AppIcon.icns from assets/icon.png)"
   ICONSET="build/AppIcon.iconset"
