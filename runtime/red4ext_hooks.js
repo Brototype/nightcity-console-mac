@@ -2027,26 +2027,25 @@ try { console.log('[GARMENT-OWNER] ' + (CET_OWNS_GARMENT ? 'CET gadget (bikini l
 // CRTTISystem::Get 0x2188e8c, CGlobalFunction ctor 0x21739e8 (sizeof 0xB8), CNamePool::Add 0x3452ddc,
 // RegisterFunction = CRTTISystem vtable+0xA0, GetFunction = vtable+0x30, InitScripts entry 0x3d8c188.
 // Disable with /tmp/cp2077_no_natreg.
-var g_natregKeep = [];   // keep Frida-allocated objects + native callbacks alive (prevent GC)
 (function installNativeReg(){
     function nlog(s){ try{ var f=new File('/tmp/cp2077_redlib.log','a'); f.write(s+'\n'); f.flush(); f.close(); }catch(e){} }
     try {
         var disabled = false; try { File.readAllText('/tmp/cp2077_no_natreg'); disabled = true; } catch(e){}
         if (disabled) { nlog('[NATREG] disabled (/tmp/cp2077_no_natreg)'); return; }
         var base = getModuleBase();
-        var READY = base.add(0x7d6a268);
-        var getRTTI = new NativeFunction(base.add(0x2188e8c), 'pointer', []);
-        var ctorGlobal = new NativeFunction(base.add(0x21739e8), 'pointer', ['pointer','uint64','uint64','pointer']);
-        var namePoolAdd = new NativeFunction(base.add(0x3452ddc), 'uint64', ['pointer']);
+        var READY = base.add(0x7d6a268);   // CRTTISystem init-done flag (bit0=1 => Get is safe)
 
-        // Native handler for `CodewareProbe() -> Void`. ScriptingFunction_t ABI:
-        //   (IScriptable* ctx, CStackFrame* frame, void* out, int64 a4)
-        // frame->code is at [frame+0]; advance it past the ParamEnd opcode (0x26) for a zero-param native.
-        var probeCb = new NativeCallback(function(ctx, frame, out, a4){
-            try { var code = frame.readPointer(); frame.writePointer(code.add(1)); } catch(e){}
-            try { var f=new File('/tmp/cp2077_codeware_probe.txt','a'); f.write('native-called\n'); f.flush(); f.close(); }catch(e){}
-        }, 'void', ['pointer','pointer','pointer','int64']);
-        g_natregKeep.push(probeCb);
+        // Resolve ArchiveXL's C export that registers the Codeware natives (create+describe+register).
+        // The registration itself lives in C++ (correct thunks + engine AddParam/SetReturnType); we only
+        // provide the TIMING - call it at InitScripts entry, the RTTI-ready-but-pre-bind window.
+        function findReg(){
+            var p = null;
+            try { p = Module.findExportByName('ArchiveXL.dylib', 'cybermodman_registerNatives'); } catch(e){}
+            if (!p) { try { Process.enumerateModules().forEach(function(m){
+                if (!p && (m.name||'').indexOf('ArchiveXL') >= 0) { try { p = m.findExportByName('cybermodman_registerNatives'); } catch(e){} }
+            }); } catch(e){} }
+            return p;
+        }
 
         var done = false;
         Interceptor.attach(base.add(0x3d8c188), { onEnter: function(a){
@@ -2055,22 +2054,13 @@ var g_natregKeep = [];   // keep Frida-allocated objects + native callbacks aliv
                 var ready = READY.readU8() & 1;
                 nlog('[NATREG] InitScripts entry; RTTI-ready flag=' + ready);
                 if (!ready) { nlog('[NATREG] RTTI not ready -> skip (Get would crash)'); return; }
-                var rtti = getRTTI();
-                var vt = rtti.readPointer();
-                var nameStr = Memory.allocUtf8String('CodewareProbe'); g_natregKeep.push(nameStr);
-                var cn = namePoolAdd(nameStr);
-                nlog('[NATREG] CName(CodewareProbe)=0x' + cn.toString(16) + ' rtti=' + rtti);
-                var fn = Memory.alloc(0xb8); g_natregKeep.push(fn);
-                ctorGlobal(fn, cn, cn, probeCb);
-                nlog('[NATREG] ctor ok fn=' + fn);
-                var regFn = new NativeFunction(vt.add(0xa0).readPointer(), 'void', ['pointer','pointer']);
-                regFn(rtti, fn);
-                nlog('[NATREG] RegisterFunction returned');
-                var getFn = new NativeFunction(vt.add(0x30).readPointer(), 'pointer', ['pointer','uint64']);
-                var got = getFn(rtti, cn);
-                nlog('[NATREG] GetFunction => ' + got + (got.isNull() ? ' NULL (registration did NOT land)' : ' FOUND (registered!)'));
+                var reg = findReg();
+                nlog('[NATREG] cybermodman_registerNatives export = ' + reg);
+                if (!reg) { nlog('[NATREG] export NOT FOUND (ArchiveXL not the natives build?)'); return; }
+                new NativeFunction(reg, 'void', [])();
+                nlog('[NATREG] called cybermodman_registerNatives');
             } catch(e){ nlog('[NATREG] ERROR ' + e); }
         }});
-        nlog('[NATREG] armed InitScripts hook @0x3d8c188');
+        nlog('[NATREG] armed InitScripts hook @0x3d8c188 (calls ArchiveXL cybermodman_registerNatives)');
     } catch(e){ nlog('[NATREG] install err ' + e); }
 })();
