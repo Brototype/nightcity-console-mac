@@ -2018,3 +2018,59 @@ try { console.log('[GARMENT-OWNER] ' + (CET_OWNS_GARMENT ? 'CET gadget (bikini l
 })();
 
 })();
+
+// ===== macOS PLUGIN-NATIVE REGISTRATION (break the "plugin RTTI invisible to redscript" wall) =====
+// Register a plugin-provided native at CBaseEngine::InitScripts entry - the one window where the RTTI system
+// is fully constructed (CRTTISystem::Get is safe) yet no script has bound its native-func declarations.
+// Plugin-load is too early (Get() force-constructs RTTI -> SIGSEGV); menu/archiveload is too late (the binder
+// already trapped on the unresolved native). Ghidra ctorhunt offsets: RTTI ready-flag byte @0x7d6a268 (bit0),
+// CRTTISystem::Get 0x2188e8c, CGlobalFunction ctor 0x21739e8 (sizeof 0xB8), CNamePool::Add 0x3452ddc,
+// RegisterFunction = CRTTISystem vtable+0xA0, GetFunction = vtable+0x30, InitScripts entry 0x3d8c188.
+// Disable with /tmp/cp2077_no_natreg.
+var g_natregKeep = [];   // keep Frida-allocated objects + native callbacks alive (prevent GC)
+(function installNativeReg(){
+    function nlog(s){ try{ var f=new File('/tmp/cp2077_redlib.log','a'); f.write(s+'\n'); f.flush(); f.close(); }catch(e){} }
+    try {
+        var disabled = false; try { File.readAllText('/tmp/cp2077_no_natreg'); disabled = true; } catch(e){}
+        if (disabled) { nlog('[NATREG] disabled (/tmp/cp2077_no_natreg)'); return; }
+        var base = getModuleBase();
+        var READY = base.add(0x7d6a268);
+        var getRTTI = new NativeFunction(base.add(0x2188e8c), 'pointer', []);
+        var ctorGlobal = new NativeFunction(base.add(0x21739e8), 'pointer', ['pointer','uint64','uint64','pointer']);
+        var namePoolAdd = new NativeFunction(base.add(0x3452ddc), 'uint64', ['pointer']);
+
+        // Native handler for `CodewareProbe() -> Void`. ScriptingFunction_t ABI:
+        //   (IScriptable* ctx, CStackFrame* frame, void* out, int64 a4)
+        // frame->code is at [frame+0]; advance it past the ParamEnd opcode (0x26) for a zero-param native.
+        var probeCb = new NativeCallback(function(ctx, frame, out, a4){
+            try { var code = frame.readPointer(); frame.writePointer(code.add(1)); } catch(e){}
+            try { var f=new File('/tmp/cp2077_codeware_probe.txt','a'); f.write('native-called\n'); f.flush(); f.close(); }catch(e){}
+        }, 'void', ['pointer','pointer','pointer','int64']);
+        g_natregKeep.push(probeCb);
+
+        var done = false;
+        Interceptor.attach(base.add(0x3d8c188), { onEnter: function(a){
+            if (done) return; done = true;
+            try {
+                var ready = READY.readU8() & 1;
+                nlog('[NATREG] InitScripts entry; RTTI-ready flag=' + ready);
+                if (!ready) { nlog('[NATREG] RTTI not ready -> skip (Get would crash)'); return; }
+                var rtti = getRTTI();
+                var vt = rtti.readPointer();
+                var nameStr = Memory.allocUtf8String('CodewareProbe'); g_natregKeep.push(nameStr);
+                var cn = namePoolAdd(nameStr);
+                nlog('[NATREG] CName(CodewareProbe)=0x' + cn.toString(16) + ' rtti=' + rtti);
+                var fn = Memory.alloc(0xb8); g_natregKeep.push(fn);
+                ctorGlobal(fn, cn, cn, probeCb);
+                nlog('[NATREG] ctor ok fn=' + fn);
+                var regFn = new NativeFunction(vt.add(0xa0).readPointer(), 'void', ['pointer','pointer']);
+                regFn(rtti, fn);
+                nlog('[NATREG] RegisterFunction returned');
+                var getFn = new NativeFunction(vt.add(0x30).readPointer(), 'pointer', ['pointer','uint64']);
+                var got = getFn(rtti, cn);
+                nlog('[NATREG] GetFunction => ' + got + (got.isNull() ? ' NULL (registration did NOT land)' : ' FOUND (registered!)'));
+            } catch(e){ nlog('[NATREG] ERROR ' + e); }
+        }});
+        nlog('[NATREG] armed InitScripts hook @0x3d8c188');
+    } catch(e){ nlog('[NATREG] install err ' + e); }
+})();
