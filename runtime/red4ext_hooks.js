@@ -2035,14 +2035,19 @@ try { console.log('[GARMENT-OWNER] ' + (CET_OWNS_GARMENT ? 'CET gadget (bikini l
         var base = getModuleBase();
         var READY = base.add(0x7d6a268);   // CRTTISystem init-done flag (bit0=1 => Get is safe)
 
-        // Resolve ArchiveXL's C export that registers the Codeware natives (create+describe+register).
-        // The registration itself lives in C++ (correct thunks + engine AddParam/SetReturnType); we only
-        // provide the TIMING - call it at InitScripts entry, the RTTI-ready-but-pre-bind window.
-        function findReg(){
+        // Resolve the C export that registers plugin natives (create+describe+register). The registration
+        // lives in C++; we only provide the TIMING - call it at InitScripts entry, the RTTI-ready-but-pre-bind
+        // window. Two sources:
+        //   - ArchiveXL.dylib cybermodman_registerNatives  (the Tier-1 stub: 20 globals + reflection stubs)
+        //   - Codeware.dylib  codeware_registerNatives      (the REAL Codeware runtime, all subsystems)
+        // They register OVERLAPPING names (FNV, Reflection, ...), so only ONE may run. When
+        // /tmp/cp2077_codeware_real exists, prefer the real Codeware export and skip the stub.
+        var useCodeware = false; try { File.readAllText('/tmp/cp2077_codeware_real'); useCodeware = true; } catch(e){}
+        function findExport(modSubstr, sym){
             var p = null;
-            try { p = Module.findExportByName('ArchiveXL.dylib', 'cybermodman_registerNatives'); } catch(e){}
+            try { p = Module.findExportByName(modSubstr + '.dylib', sym); } catch(e){}
             if (!p) { try { Process.enumerateModules().forEach(function(m){
-                if (!p && (m.name||'').indexOf('ArchiveXL') >= 0) { try { p = m.findExportByName('cybermodman_registerNatives'); } catch(e){} }
+                if (!p && (m.name||'').indexOf(modSubstr) >= 0) { try { p = m.findExportByName(sym); } catch(e){} }
             }); } catch(e){} }
             return p;
         }
@@ -2052,15 +2057,54 @@ try { console.log('[GARMENT-OWNER] ' + (CET_OWNS_GARMENT ? 'CET gadget (bikini l
             if (done) return; done = true;
             try {
                 var ready = READY.readU8() & 1;
-                nlog('[NATREG] InitScripts entry; RTTI-ready flag=' + ready);
+                nlog('[NATREG] InitScripts entry; RTTI-ready flag=' + ready + (useCodeware ? ' (real Codeware)' : ' (ArchiveXL stub)'));
                 if (!ready) { nlog('[NATREG] RTTI not ready -> skip (Get would crash)'); return; }
-                var reg = findReg();
-                nlog('[NATREG] cybermodman_registerNatives export = ' + reg);
-                if (!reg) { nlog('[NATREG] export NOT FOUND (ArchiveXL not the natives build?)'); return; }
+                var reg, sym;
+                if (useCodeware) { sym = 'codeware_registerNatives'; reg = findExport('Codeware', sym); }
+                else             { sym = 'cybermodman_registerNatives'; reg = findExport('ArchiveXL', sym); }
+                nlog('[NATREG] ' + sym + ' export = ' + reg);
+                if (!reg) { nlog('[NATREG] export NOT FOUND (' + (useCodeware ? 'Codeware.dylib loaded?' : 'ArchiveXL natives build?') + ')'); return; }
                 new NativeFunction(reg, 'void', [])();
-                nlog('[NATREG] called cybermodman_registerNatives');
+                nlog('[NATREG] called ' + sym);
             } catch(e){ nlog('[NATREG] ERROR ' + e); }
         }});
-        nlog('[NATREG] armed InitScripts hook @0x3d8c188 (calls ArchiveXL cybermodman_registerNatives)');
+        nlog('[NATREG] armed InitScripts hook @0x3d8c188 (' + (useCodeware ? 'codeware_registerNatives' : 'cybermodman_registerNatives') + ')');
     } catch(e){ nlog('[NATREG] install err ' + e); }
+})();
+
+// BIND DIAGNOSTIC (Ghidra 2026-07-04): the redscript binder has per-kind validators for native imports.
+// Each takes the entity DESCRIPTOR in x1 with the failing name as a CName (u64 hash) at [x1+0x8], and
+// returns null/0 on failure. CNamePool::Get (0x3452bdc) resolves the hash -> const char*. On macOS the
+// specific unresolved-native reason is NOT written to any log before the SIGTRAP at 0x3da2a60, so this
+// hooks the validators directly and writes the failing name to /tmp/cp2077_bindfail.log. Gated on
+// /tmp/cp2077_bindfail (create it to enable) so it never runs in normal play. Name resolved only on
+// failure (onLeave), so the thousands of successful resolves cost nothing.
+(function installBindDiag(){
+    function blog(s){ try{ var f=new File('/tmp/cp2077_bindfail.log','a'); f.write(s+'\n'); f.flush(); f.close(); }catch(e){} }
+    try {
+        var on=false; try{ File.readAllText('/tmp/cp2077_bindfail'); on=true; }catch(e){}
+        if(!on) return;
+        var base = getModuleBase();
+        var cnameGet = new NativeFunction(base.add(0x3452bdc), 'pointer', ['uint64']);
+        function nameOf(desc){
+            try { var h = desc.add(0x8).readU64(); var p = cnameGet(h);
+                  return (p && !p.isNull()) ? p.readUtf8String() : ('<hash 0x'+h.toString(16)+'>'); }
+            catch(e){ return '<err '+e+'>'; }
+        }
+        var kinds = [
+            [0x21fcee0, 'global-func'], [0x21fc61c, 'class'], [0x21fc1a4, 'typeref'],
+            [0x21fc290, 'enum'], [0x21fc47c, 'bitfield'],
+        ];
+        kinds.forEach(function(k){
+            try { Interceptor.attach(base.add(k[0]), {
+                onEnter: function(a){ this.desc = a[1]; },
+                onLeave: function(r){ if (r.isNull()) blog('[BIND-FAIL] missing native ' + k[1] + ': ' + nameOf(this.desc)); }
+            }); } catch(e){ blog('[BIND-DIAG] attach err '+k[1]+' '+e); }
+        });
+        // Unresolved param/return/local type: log the owning FUNCTION name at entry (type name is built, not a CName).
+        try { Interceptor.attach(base.add(0x21ea1b8), {
+            onEnter: function(a){ blog('[BIND-FAIL] unresolved type in function: ' + nameOf(a[1])); }
+        }); } catch(e){ blog('[BIND-DIAG] attach err unres-type '+e); }
+        blog('[BIND-DIAG] armed ' + (kinds.length+1) + ' validator hooks');
+    } catch(e){ blog('[BIND-DIAG] install err ' + e); }
 })();
