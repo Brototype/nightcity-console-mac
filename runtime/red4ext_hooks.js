@@ -2027,6 +2027,23 @@ try { console.log('[GARMENT-OWNER] ' + (CET_OWNS_GARMENT ? 'CET gadget (bikini l
 // CRTTISystem::Get 0x2188e8c, CGlobalFunction ctor 0x21739e8 (sizeof 0xB8), CNamePool::Add 0x3452ddc,
 // RegisterFunction = CRTTISystem vtable+0xA0, GetFunction = vtable+0x30, InitScripts entry 0x3d8c188.
 // Disable with /tmp/cp2077_no_natreg.
+
+// Shared registry for the bug-#1 finalize preserve hooks (installFinalizeFix below). They hook FUN_1000286e8
+// (the engine DynArray re-capacity), which is EXTREMELY hot - every DynArray resize in the whole engine goes
+// through the Frida trampoline. The finalize we care about happens ONCE, inside CBaseEngine::InitScripts; after
+// that the hooks are pure overhead (observed: ~4x slower save-load). So installFinalizeFix registers its
+// listeners here, and installNativeReg DETACHES them at InitScripts onLeave (finalize done) -> no gameplay cost.
+var g_finalizeHookListeners = [];
+var g_finalizeHooksDetached = false;
+function g_detachFinalizeHooks() {
+    if (g_finalizeHooksDetached) return 0;
+    g_finalizeHooksDetached = true;
+    var n = 0;
+    g_finalizeHookListeners.forEach(function (l) { try { l.detach(); n++; } catch (e) {} });
+    g_finalizeHookListeners = [];
+    return n;
+}
+
 (function installNativeReg(){
     function nlog(s){ try{ var f=new File('/tmp/cp2077_redlib.log','a'); f.write(s+'\n'); f.flush(); f.close(); }catch(e){} }
     try {
@@ -2109,6 +2126,9 @@ try { console.log('[GARMENT-OWNER] ' + (CET_OWNS_GARMENT ? 'CET gadget (bikini l
                 } catch(e2){ nlog('[PS-SWEEP] ERROR ' + e2); }
             } catch(e){ nlog('[NATREG] ERROR ' + e); }
         }});
+        // NOTE: the finalize preserve hooks are detached by installFinalizeFix itself, at the LEAVE of the
+        // per-class finalize DRIVER FUN_1021950fc (the true "finalize done" point) - NOT here at InitScripts
+        // onLeave, which fires too early (the driver runs later inside InitScripts; detaching here left #1 unfixed).
         nlog('[NATREG] armed InitScripts hook @0x3d8c188 (' + (useCodeware ? 'codeware_registerNatives' : 'cybermodman_registerNatives') + ')');
     } catch(e){ nlog('[NATREG] install err ' + e); }
 })();
@@ -2168,8 +2188,12 @@ try { console.log('[GARMENT-OWNER] ' + (CET_OWNS_GARMENT ? 'CET gadget (bikini l
 (function installFinalizeFix(){
     function flog(s){ try{ var f=new File('/tmp/cp2077_finaldiag.log','a'); f.write(s+'\n'); f.flush(); f.close(); }catch(e){} }
     try {
-        var on=false; try{ File.readAllText('/tmp/cp2077_finaldiag'); on=true; }catch(e){}
-        if(!on) return;
+        // The bug-#1 preserve fix runs whenever Codeware is active (/tmp/cp2077_codeware_real); the verbose
+        // per-class diagnostics are extra and only run under /tmp/cp2077_finaldiag. Either flag arms the hooks;
+        // installNativeReg detaches them all at InitScripts onLeave so there is no gameplay overhead.
+        var diag=false; try{ File.readAllText('/tmp/cp2077_finaldiag'); diag=true; }catch(e){}
+        var fix=false;  try{ File.readAllText('/tmp/cp2077_codeware_real'); fix=true; }catch(e){}
+        if(!diag && !fix) return;
         var base = getModuleBase();
         var cnameGet = new NativeFunction(base.add(0x3452bdc), 'pointer', ['uint64']);
         function nm(h){ try{ var p=cnameGet(h); return (p&&!p.isNull())?p.readUtf8String():('#0x'+h.toString(16)); }catch(e){ return '<e>'; } }
@@ -2228,18 +2252,19 @@ try { console.log('[GARMENT-OWNER] ' + (CET_OWNS_GARMENT ? 'CET gadget (bikini l
         // default vs OTHER = the provenance answer); on leave, if the realloc zeroed them, write them back.
         var FIN_FNS = [0x219e270, 0x219dce0, 0x219dfb4];
         var finCtx = {};   // threadId -> {cls, depth}
-        function finEnter(tid, p){ var c=finCtx[tid]; if(!c){ c={cls:null,depth:0}; finCtx[tid]=c; }
+        var g_lastFinAt = 0;   // Date.now() of the most recent finalize call (drives the auto-detach timer)
+        function finEnter(tid, p){ g_lastFinAt = Date.now(); var c=finCtx[tid]; if(!c){ c={cls:null,depth:0}; finCtx[tid]=c; }
             if(c.depth===0){ c.cls = looksLikeClass(p) ? p : null; } c.depth++; }
         function finLeave(tid){ var c=finCtx[tid]; if(!c) return; c.depth--; if(c.depth<=0){ c.depth=0; c.cls=null; } }
         FIN_FNS.forEach(function(off){
-            Interceptor.attach(base.add(off), {
+            g_finalizeHookListeners.push(Interceptor.attach(base.add(off), {
                 onEnter: function(a){ finEnter(this.threadId, a[0]); },
                 onLeave: function(){ finLeave(this.threadId); }
-            });
+            }));
         });
         var defHandle = base.add(0x6e4aee8);
         var recapLogs = 0, recapFixes = 0;
-        Interceptor.attach(base.add(0x286e8), {
+        g_finalizeHookListeners.push(Interceptor.attach(base.add(0x286e8), {
             onEnter: function(a){
                 this.rec = null;
                 var c = finCtx[this.threadId]; if(!c || !c.cls) return;
@@ -2260,9 +2285,19 @@ try { console.log('[GARMENT-OWNER] ' + (CET_OWNS_GARMENT ? 'CET gadget (bikini l
                 }
                 this.rec = rec;
                 if(recapLogs<200){
+                    // PROVENANCE PROBE (first 12): which MODULE owns the allocator handle + its realloc fn?
+                    // If Codeware.dylib -> our SDK Allocator<T> (the alloc-fix would work); if the main exe /
+                    // Cyberpunk2077 -> an ENGINE allocator (the alloc-fix would NOT touch these arrays).
+                    var prov = '';
+                    if(recapLogs<12 && rec.handle && !rec.handle.isNull()){
+                        var hmod='?', rmod='?';
+                        try{ var m=Process.findModuleByAddress(rec.handle); hmod=m?m.name:'<none>'; }catch(e){}
+                        try{ var vt=rec.handle.readPointer(); var rf=vt.add(0x18).readPointer(); var rm=Process.findModuleByAddress(rf); rmod=(rm?rm.name:'<none>')+'@'+rf; }catch(e){}
+                        prov = ' handleMod=' + hmod + ' reallocFn=' + rmod;
+                    }
                     flog('[RECAP] cls='+rec.cls+' off=0x'+offv.toString(16)+' buf='+buf+' cap='+cap+' size='+size
                         +' -> newCap='+newCap+' elem='+elem
-                        +' handle='+(rec.handle ? (rec.handle+(rec.handle.equals(defHandle)?' (default)':' (OTHER!)')) : 'n/a'));
+                        +' handle='+(rec.handle ? (rec.handle+(rec.handle.equals(defHandle)?' (default)':' (OTHER!)')) : 'n/a') + prov);
                     recapLogs++;
                 }
             },
@@ -2284,8 +2319,9 @@ try { console.log('[GARMENT-OWNER] ' + (CET_OWNS_GARMENT ? 'CET gadget (bikini l
                     }
                 }catch(e){ flog('[RECAP] leave err '+e); }
             }
-        });
-        // ============ end re-capacity preserve fix ============
+        }));
+        // ============ end re-capacity preserve fix (the ONLY hook needed for bug #1; RECAP-FIX did all 19
+        // restores in the good run, collector/dfb4 below contributed 0 -> they are diagnostics, diag-gated) ====
         // Dump an overriddenProps-style array (16-byte pairs {prop@0, extra@8}, count in PAIRS at off+0xc).
         function dumpPairs(tag, cls, off){ var d=darr(cls,off); if(!d){ flog('  '+tag+' <no darr>'); return; }
             flog('  '+tag+' ptr='+d.ptr+' cap='+d.cap+' size(pairs)='+d.size);
@@ -2305,7 +2341,10 @@ try { console.log('[GARMENT-OWNER] ' + (CET_OWNS_GARMENT ? 'CET gadget (bikini l
         // If unk118 has a null-ptr/null-type entry, DUMP the class (props@0x28 + overriddenProps@0x38 + unk118) so
         // the source is identifiable, then COMPACT unk118 (fix size@0x124) so both walks survive. No looksLikeClass
         // gate (unk118 is stale at dce0 onEnter, which made the previous gate skip the culprit).
-        Interceptor.attach(base.add(0x2197928), {
+        // The collector + dfb4 hooks below contributed 0 fixes in the good run (RECAP does all the work); they are
+        // DIAGNOSTIC-ONLY now, armed only under /tmp/cp2077_finaldiag so normal Codeware play skips them.
+        if(diag){
+        g_finalizeHookListeners.push(Interceptor.attach(base.add(0x2197928), {
             onEnter: function(a){ this.cls = a[0]; this.out = a[1]; },
             onLeave: function(){
                 try{
@@ -2338,10 +2377,10 @@ try { console.log('[GARMENT-OWNER] ' + (CET_OWNS_GARMENT ? 'CET gadget (bikini l
                     }
                 }catch(e){ flog('[COLLECTOR] onLeave err '+e); }
             }
-        });
+        }));
         // FUN_10219dfb4 @0x219dfb4 onEnter: belt-and-suspenders - compact unk118 (should already be clean). Do NOT
         // touch list@0x128 (sparse-by-design; compacting it misaligns the parallel serialization structures).
-        Interceptor.attach(base.add(0x219dfb4), {
+        g_finalizeHookListeners.push(Interceptor.attach(base.add(0x219dfb4), {
             onEnter: function(a){
                 try{
                     var cls = a[0];
@@ -2352,8 +2391,24 @@ try { console.log('[GARMENT-OWNER] ' + (CET_OWNS_GARMENT ? 'CET gadget (bikini l
                     if(d1>0 && logCount<160){ flog('[DFB4-BACKUP] class='+nameHash(cls)+' unk118 compacted='+d1); logCount++; }
                 }catch(e){ flog('[DFB4] onEnter err '+e); }
             }
-        });
-        flog('[FINAL-DIAG] armed COLLECTOR(0x2197928) unk118 fix+dump + DFB4 backup-compact');
+        }));
+        }
+        // AUTO-DETACH: FUN_1000286e8 is a hot path; keep the preserve hook only for the one-shot startup class
+        // finalize. Poll: once finalize activity has been quiet for 5s (all our classes finalized, game at menu,
+        // before any save-load), detach ALL preserve hooks so 286e8 runs natively -> zero save-load/gameplay cost.
+        // Timer-based so it is robust to the finalize driver FUN_1021950fc being called in multiple batches
+        // (detaching on a single driver onLeave fired too early and left #1 unfixed).
+        var g_detachPoll = setInterval(function(){
+            try {
+                if(g_finalizeHooksDetached){ clearInterval(g_detachPoll); return; }
+                if(g_lastFinAt > 0 && (Date.now() - g_lastFinAt) > 5000){
+                    var n = g_detachFinalizeHooks();
+                    flog('[FINAL] auto-detached '+n+' preserve hooks (finalize quiet 5s) -> native 286e8, no gameplay overhead');
+                    clearInterval(g_detachPoll);
+                }
+            } catch(e){ flog('[FINAL] detach-poll err '+e); }
+        }, 1000);
+        flog('[FINAL-DIAG] armed finalize preserve fix (fix='+fix+' diag='+diag+', '+g_finalizeHookListeners.length+' hooks, auto-detach 5s after finalize settles)');
         // NOTE: do NOT Interceptor.attach FUN_10219721c (CClass teardown) or any function that runs on the
         // engine worker/redDispatcher threads - the macOS-27 frida-gum trampoline is broken on those threads
         // (SIGBUS in the trampoline before onEnter runs; confirmed 2026-07-05). Bug #2 (worker-thread async
