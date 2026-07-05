@@ -2066,6 +2066,47 @@ try { console.log('[GARMENT-OWNER] ' + (CET_OWNS_GARMENT ? 'CET gadget (bikini l
                 if (!reg) { nlog('[NATREG] export NOT FOUND (' + (useCodeware ? 'Codeware.dylib loaded?' : 'ArchiveXL natives build?') + ')'); return; }
                 new NativeFunction(reg, 'void', [])();
                 nlog('[NATREG] called ' + sym);
+
+                // ---- Bug #2 validation (Ghidra + workflow-verified 2026-07-05): the persistence-schema rebuild
+                // job (PersistencySystem::OnInitialize FUN_103fec750, enqueued LATER on THIS main thread, runs on
+                // a worker) does GetClasses(gamePersistentState) and tears down every subclass via the CClass
+                // teardown FUN_10219721c. Codeware's DynamicEntitySystemPS (hash 0x77152b1b8dcbb39d) derives from
+                // Red::PersistentState == gamePersistentState (0xfce73aa1e8b0cd2f), so it is swept; its teardown
+                // faults on our-provenance memory (bug #2, un-hookable on the worker). Here, MAIN-THREAD and
+                // BEFORE the job is enqueued: (a) log the whole sweep set to confirm which of OUR classes are in
+                // it; (b) if /tmp/cp2077_ps_reparent is set, sever DynamicEntitySystemPS's persistent ancestry
+                // (parent@+0x10 -> gamePersistentState's own parent) so GetClasses no longer selects it. All
+                // read-only + one pointer write on the main thread => gum-safe. Confirms the mechanism + fix.
+                try {
+                    var reparent = false; try { File.readAllText('/tmp/cp2077_ps_reparent'); reparent = true; } catch(e2){}
+                    var getRTTI = new NativeFunction(base.add(0x2188e8c), 'pointer', []);
+                    var getGPS  = new NativeFunction(base.add(0x1f8ead8), 'pointer', []);
+                    var sys = getRTTI(), gps = getGPS();
+                    function clsHash(c){ try{ var v=c.readPointer(); var gn=new NativeFunction(v.add(0x10).readPointer(),'uint64',['pointer']); return gn(c).toString(16); }catch(e2){ return '<e>'; } }
+                    if (!sys.isNull() && !gps.isNull()) {
+                        var gh = clsHash(gps);
+                        nlog('[PS-SWEEP] gamePersistentState cls=' + gps + ' hash=0x' + gh + ' (expect fce73aa1e8b0cd2f) reparentFlag=' + reparent);
+                        var vt = sys.readPointer();
+                        var getClasses = new NativeFunction(vt.add(0x70).readPointer(), 'void', ['pointer','pointer','pointer','int','int']);
+                        var out = Memory.alloc(0x10); out.writeU64(0); out.add(8).writeU64(0);
+                        getClasses(sys, gps, out, 0, 0);
+                        var arr = out.readPointer(), n = out.add(0xc).readU32();
+                        var gpsParent = gps.add(0x10).readPointer();
+                        nlog('[PS-SWEEP] GetClasses(gamePersistentState) count=' + n + ' gpsParent=' + gpsParent);
+                        var lim = (n > 8192) ? 8192 : n, reN = 0, logged = 0;
+                        for (var i = 0; i < lim; i++) {
+                            var cls = arr.add(i*8).readPointer(); if (cls.isNull()) continue;
+                            var h = clsHash(cls);
+                            var mine = (h === '77152b1b8dcbb39d');
+                            if (logged < 80 || mine) { nlog('  [PS-SUB] ' + cls + ' hash=0x' + h + (mine ? '  <== DynamicEntitySystemPS (OURS)' : '')); logged++; }
+                            if (mine && reparent) {
+                                try { cls.add(0x10).writePointer(gpsParent); reN++; nlog('  [PS-REPARENT] DynamicEntitySystemPS parent@+0x10 -> ' + gpsParent + ' (severed gamePersistentState ancestry; de-selected from sweep)'); }
+                                catch(e2){ nlog('  [PS-REPARENT] write err ' + e2); }
+                            }
+                        }
+                        nlog('[PS-SWEEP] done: subclasses=' + n + ' reparented=' + reN);
+                    } else { nlog('[PS-SWEEP] sys=' + sys + ' gps=' + gps + ' (skipped)'); }
+                } catch(e2){ nlog('[PS-SWEEP] ERROR ' + e2); }
             } catch(e){ nlog('[NATREG] ERROR ' + e); }
         }});
         nlog('[NATREG] armed InitScripts hook @0x3d8c188 (' + (useCodeware ? 'codeware_registerNatives' : 'cybermodman_registerNatives') + ')');
@@ -2107,4 +2148,216 @@ try { console.log('[GARMENT-OWNER] ' + (CET_OWNS_GARMENT ? 'CET gadget (bikini l
         }); } catch(e){ blog('[BIND-DIAG] attach err unres-type '+e); }
         blog('[BIND-DIAG] armed ' + (kinds.length+1) + ' validator hooks');
     } catch(e){ blog('[BIND-DIAG] install err ' + e); }
+})();
+
+// Property-layout finalize fix+diagnostic (Ghidra-verified 2026-07-04). Per-class finalize wrapper FUN_10219e270:
+//   FUN_10219dce0(cls,1)  builds unk118@0x118 via collector FUN_102197928 (walks parent chain, memcpys each
+//                         class's own props@0x28 sized by size@0x34), then WALKS unk118 derefing entry->type@0
+//                         (crash 0x219de10 ldr x0,[x8] x8=0 when an entry POINTER is null) + entry->name@8.
+//   FUN_102198670(cls,cls+0x128)  builds list@0x128 (a SPARSE savable-subset; slot 0 legitimately null - a RED
+//                         HERRING, nothing that crashes reads it; do NOT touch it).
+//   FUN_10219dfb4(cls)    WALKS THE SAME unk118 reading entry->flags byte@0x2a with NO null-ptr guard
+//                         (crash 0x219e014 ldrb [x24,#0x2a] x24=0 when an entry POINTER is null).
+// So BOTH crashes are one defect: a NULL POINTER inside unk118, which the collector can only get by copying a
+// null out of some parent-chain class's props@0x28 (size@0x34 over-counts / embedded null). Engine classes are
+// clean (game boots normally); the null is in a CODEWARE class's OWN props@0x28. FIX = at FUN_10219dce0 onEnter,
+// BEFORE the collector runs, walk the class's parent chain (+0x10) and COMPACT props@0x28 at each node - drop
+// only null-pointer / null-type entries (never valid ones) and fix size@0x34 - so the collector builds a clean
+// unk118 and both walks survive. dfb4 gets a belt-and-suspenders unk118 compact. The log names the exact
+// class+prop for the durable source fix. Gated on /tmp/cp2077_finaldiag; logs to /tmp/cp2077_finaldiag.log.
+(function installFinalizeFix(){
+    function flog(s){ try{ var f=new File('/tmp/cp2077_finaldiag.log','a'); f.write(s+'\n'); f.flush(); f.close(); }catch(e){} }
+    try {
+        var on=false; try{ File.readAllText('/tmp/cp2077_finaldiag'); on=true; }catch(e){}
+        if(!on) return;
+        var base = getModuleBase();
+        var cnameGet = new NativeFunction(base.add(0x3452bdc), 'pointer', ['uint64']);
+        function nm(h){ try{ var p=cnameGet(h); return (p&&!p.isNull())?p.readUtf8String():('#0x'+h.toString(16)); }catch(e){ return '<e>'; } }
+        function typeName(t){ try{ if(t.isNull()) return '<null>'; var vt=t.readPointer(); if(vt.isNull()) return '<nv>';
+            var gn=new NativeFunction(vt.add(0x10).readPointer(),'uint64',['pointer']); return nm(gn(t)); }catch(e){ return '<e>'; } }
+        function nameHash(t){ try{ var vt=t.readPointer(); if(vt.isNull()) return '<nv>'; var gn=new NativeFunction(vt.add(0x10).readPointer(),'uint64',['pointer']); var h=gn(t); return '0x'+h.toString(16)+'('+nm(h)+')'; }catch(e){ return '<e>'; } }
+        // DynArray {ptr@off, cap@off+8 u32, size@off+0xc u32}.
+        function darr(p, off){ try{ return { ptr:p.add(off).readPointer(), cap:p.add(off+8).readU32(), size:p.add(off+0xc).readU32() }; }catch(e){ return null; } }
+        // Which arg is the real CClass: readable vtable + self-consistent props@0x28 and unk118@0x118 DynArrays.
+        function looksLikeClass(p){ try{ if(p.isNull()) return false; var vt=p.readPointer(); if(vt.isNull()) return false; vt.readPointer();
+            var a=darr(p,0x28), b=darr(p,0x118); if(!a||!b) return false;
+            if(a.size>a.cap+1 || b.size>b.cap+1) return false; if(a.cap>200000 || b.cap>200000) return false; return true; }catch(e){ return false; } }
+        function pickClass(a){ if(looksLikeClass(a[0])) return {cls:a[0],arg:0}; if(looksLikeClass(a[1])) return {cls:a[1],arg:1}; return null; }
+        function arrHasNull(cls, off){ var d=darr(cls,off); if(!d||d.ptr.isNull()||d.size===0||d.size>200000) return false;
+            for(var i=0;i<d.size;i++){ try{ var e=d.ptr.add(i*8).readPointer(); if(e.isNull()) return true; if(e.readPointer().isNull()) return true; }catch(x){ return true; } } return false; }
+        function dumpArr(tag, cls, off){ var d=darr(cls,off); if(!d){ flog('  '+tag+' <no darr>'); return; }
+            flog('  '+tag+' ptr='+d.ptr+' cap='+d.cap+' size='+d.size);
+            if(d.ptr.isNull()||d.size===0||d.size>200000) return;
+            var n=Math.min(d.size, 64);
+            for(var i=0;i<n;i++){ try{ var e=d.ptr.add(i*8).readPointer();
+                if(e.isNull()){ flog('    ['+i+'] <NULLPTR>'); continue; }
+                var ty; try{ ty=e.readPointer(); }catch(x){ flog('    ['+i+'] p='+e+' <BADPTR>'); continue; }
+                var pnm='?'; try{ pnm=nm(e.add(8).readU64()); }catch(x){}
+                var fl='?'; try{ fl='0x'+e.add(0x28).readU64().toString(16); }catch(x){}
+                flog('    ['+i+'] p='+e+' typeptr='+ty+' name='+pnm+' type='+(ty.isNull()?'<NULLTYPE>':typeName(ty))+' flags='+fl);
+            }catch(x){ flog('    ['+i+'] <err '+x+'>'); } }
+        }
+        // Targeted capture of the two known crashing classes (by name-hash) so we can compare prop/type pointers
+        // at collector-leave (props valid) vs dfb4 (types nulled) and find WHAT nulls them.
+        var TARGETS = { '0x404d2a0f9a0c3989':'SoundBanksJson', '0xca1bb34ad933a066':'DynamicEntitySpec' };
+        function clsHashHex(cls){ try{ var vt=cls.readPointer(); if(vt.isNull()) return null;
+            var gn=new NativeFunction(vt.add(0x10).readPointer(),'uint64',['pointer']); return '0x'+gn(cls).toString(16); }catch(e){ return null; } }
+        function dumpFull(where, cls){ flog('#### ['+where+'] '+nameHash(cls)+' ####');
+            dumpArr('  props@0x28 ', cls, 0x28); dumpArr('  unk118     ', cls, 0x118); }
+        function dumpParents(cls){ var n=cls, g=0; while(n && !n.isNull() && g<32){
+            var par; try{ par=n.add(0x10).readPointer(); }catch(x){ break; }
+            if(par.isNull()) { flog('  parent chain end at '+nameHash(n)); break; }
+            flog('  parent: '+nameHash(par)); dumpArr('    parent props@0x28', par, 0x28);
+            if(par.equals(n)) break; n=par; g++; } }
+        // Drop null-pointer / null-type entries in a DynArray at (off, count@off+0xc). Returns #dropped.
+        function compact(cls, off){ var d=darr(cls,off); if(!d||d.ptr.isNull()||d.size===0||d.size>200000) return 0;
+            var w=0, dropped=0; for(var i=0;i<d.size;i++){ var e; try{ e=d.ptr.add(i*8).readPointer(); }catch(x){ dropped++; continue; }
+                var drop=e.isNull(); if(!drop){ try{ if(e.readPointer().isNull()) drop=true; }catch(x){ drop=true; } }
+                if(drop){ dropped++; continue; } if(w!==i) d.ptr.add(w*8).writePointer(e); w++; }
+            if(dropped>0) cls.add(off+0xc).writeU32(w); return dropped; }
+        var logCount = 0;
+        // ============ RE-CAPACITY PRESERVE FIX (the root-cause repair, Ghidra-verified 2026-07-04) ============
+        // FUN_1000286e8 (redContainers dynamicBuffer re-capacity) picks its allocator from a TRAILING HANDLE word
+        // stored after the entries (buf + alignUp8(cap*elem)); default handle = &table@0x6e4aee8. The realloc
+        // (handle fn +0x18 -> FUN_100022a84 -> FUN_10000ffac) sizes its preserve-copy by looking the OLD pointer
+        // up in the ENGINE HEAP's own block registry - if that lookup fails the buffer comes back FRESH with
+        // preserved=0 and 286e8 bzeroes it: silent data loss. Observed on our classes' finalize arrays: grow 1->2
+        // nulled slot 0 (SoundBanksJson), shrink 13->12 nulled all 12 (DynamicEntitySpec). FIX: hook 286e8, but
+        // ONLY for the four finalize arrays (cls+0x118 unk118, +0x128, +0x138, +0x148) of the class currently
+        // inside FUN_10219e270/dce0/dfb4 (per-thread ctx). Save entries on enter (+ log the trailing handle:
+        // default vs OTHER = the provenance answer); on leave, if the realloc zeroed them, write them back.
+        var FIN_FNS = [0x219e270, 0x219dce0, 0x219dfb4];
+        var finCtx = {};   // threadId -> {cls, depth}
+        function finEnter(tid, p){ var c=finCtx[tid]; if(!c){ c={cls:null,depth:0}; finCtx[tid]=c; }
+            if(c.depth===0){ c.cls = looksLikeClass(p) ? p : null; } c.depth++; }
+        function finLeave(tid){ var c=finCtx[tid]; if(!c) return; c.depth--; if(c.depth<=0){ c.depth=0; c.cls=null; } }
+        FIN_FNS.forEach(function(off){
+            Interceptor.attach(base.add(off), {
+                onEnter: function(a){ finEnter(this.threadId, a[0]); },
+                onLeave: function(){ finLeave(this.threadId); }
+            });
+        });
+        var defHandle = base.add(0x6e4aee8);
+        var recapLogs = 0, recapFixes = 0;
+        Interceptor.attach(base.add(0x286e8), {
+            onEnter: function(a){
+                this.rec = null;
+                var c = finCtx[this.threadId]; if(!c || !c.cls) return;
+                var d = a[0], offv = -1;
+                if(d.equals(c.cls.add(0x118))) offv=0x118;
+                else if(d.equals(c.cls.add(0x128))) offv=0x128;
+                else if(d.equals(c.cls.add(0x138))) offv=0x138;
+                else if(d.equals(c.cls.add(0x148))) offv=0x148;
+                if(offv<0) return;
+                var buf = d.readPointer(), cap = d.add(8).readU32(), size = d.add(0xc).readU32();
+                var newCap = a[1].toInt32(), elem = a[2].toInt32();
+                if(size>100000 || newCap<0 || elem<=0 || elem>64) return;
+                var rec = { d:d, cls:c.cls, off:offv, buf:buf, cap:cap, size:size, newCap:newCap, elem:elem, saved:null, keep:0, handle:null };
+                if(!buf.isNull() && cap>0){ try{ rec.handle = buf.add((cap*elem+7)&~7).readPointer(); }catch(e){} }
+                if(!buf.isNull() && size>0){
+                    var keep = Math.min(size, newCap) * elem;
+                    if(keep>0){ try{ rec.saved = buf.readByteArray(keep); rec.keep = keep; }catch(e){} }
+                }
+                this.rec = rec;
+                if(recapLogs<200){
+                    flog('[RECAP] cls='+rec.cls+' off=0x'+offv.toString(16)+' buf='+buf+' cap='+cap+' size='+size
+                        +' -> newCap='+newCap+' elem='+elem
+                        +' handle='+(rec.handle ? (rec.handle+(rec.handle.equals(defHandle)?' (default)':' (OTHER!)')) : 'n/a'));
+                    recapLogs++;
+                }
+            },
+            onLeave: function(){
+                var rec = this.rec; if(!rec || !rec.saved) return;
+                try{
+                    var nb = rec.d.readPointer(); if(nb.isNull()) return;
+                    var cur = new Uint8Array(nb.readByteArray(rec.keep));
+                    var sav = new Uint8Array(rec.saved);
+                    var same = true, allz = true;
+                    for(var i=0;i<rec.keep;i++){ if(cur[i]!==sav[i]) same=false; if(cur[i]!==0) allz=false; }
+                    if(!same){
+                        if(allz){
+                            nb.writeByteArray(rec.saved);
+                            recapFixes++;
+                            if(recapFixes<=200) flog('[RECAP-FIX #'+recapFixes+'] cls='+rec.cls+' off=0x'+rec.off.toString(16)
+                                +' restored '+rec.keep+' bytes ('+rec.buf+' -> '+nb+')');
+                        } else if(recapLogs<220){ flog('[RECAP-DIFF-NONZERO] cls='+rec.cls+' off=0x'+rec.off.toString(16)); recapLogs++; }
+                    }
+                }catch(e){ flog('[RECAP] leave err '+e); }
+            }
+        });
+        // ============ end re-capacity preserve fix ============
+        // Dump an overriddenProps-style array (16-byte pairs {prop@0, extra@8}, count in PAIRS at off+0xc).
+        function dumpPairs(tag, cls, off){ var d=darr(cls,off); if(!d){ flog('  '+tag+' <no darr>'); return; }
+            flog('  '+tag+' ptr='+d.ptr+' cap='+d.cap+' size(pairs)='+d.size);
+            if(d.ptr.isNull()||d.size===0||d.size>200000) return;
+            var n=Math.min(d.size,48);
+            for(var i=0;i<n;i++){ try{ var e=d.ptr.add(i*16).readPointer();
+                if(e.isNull()){ flog('    ['+i+'] prop=<NULL>'); continue; }
+                var pnm='?'; try{ pnm=nm(e.add(8).readU64()); }catch(x){}
+                var ty; try{ ty=e.readPointer(); }catch(x){ flog('    ['+i+'] prop='+e+' <BADPTR>'); continue; }
+                flog('    ['+i+'] prop='+e+' name='+pnm+' type='+(ty.isNull()?'<NULLTYPE>':typeName(ty)));
+            }catch(x){ flog('    ['+i+'] <err '+x+'>'); } }
+        }
+        // FUN_102197928 @0x2197928 = the collector. It RECURSES the parent chain (all levels share the SAME out
+        // pointer = original class + 0x118) and memcpys each class's props@0x28 into out, with an override-
+        // substitution pass. We hook its LEAVE and act ONLY on the OUTERMOST call (out == cls+0x118, i.e. this
+        // level's class owns out) - at that point unk118 is fully built, and this fires BEFORE dce0's first walk.
+        // If unk118 has a null-ptr/null-type entry, DUMP the class (props@0x28 + overriddenProps@0x38 + unk118) so
+        // the source is identifiable, then COMPACT unk118 (fix size@0x124) so both walks survive. No looksLikeClass
+        // gate (unk118 is stale at dce0 onEnter, which made the previous gate skip the culprit).
+        Interceptor.attach(base.add(0x2197928), {
+            onEnter: function(a){ this.cls = a[0]; this.out = a[1]; },
+            onLeave: function(){
+                try{
+                    var cls = this.cls, out = this.out;
+                    if(cls.isNull() || out.isNull()) return;
+                    if(!out.equals(cls.add(0x118))) return;              // outermost only
+                    var th = clsHashHex(cls);
+                    if(th && TARGETS[th] && logCount<80){ dumpFull('COLLECTOR-LEAVE', cls); dumpParents(cls); logCount++; }
+                    var ptr = out.readPointer(); var size = out.add(0xc).readU32();
+                    if(ptr.isNull() || size===0 || size>200000) return;
+                    var w=0, dropped=0, reasons=[];
+                    for(var i=0;i<size;i++){
+                        var e; try{ e=ptr.add(i*8).readPointer(); }catch(x){ dropped++; if(reasons.length<12) reasons.push(i+':badslot'); continue; }
+                        var drop=false, why='';
+                        if(e.isNull()){ drop=true; why='NULLPTR'; }
+                        else { var ty; try{ ty=e.readPointer(); }catch(x){ drop=true; why='BADPTR'; }
+                               if(!drop && ty.isNull()){ drop=true; why='NULLTYPE'; } }
+                        if(drop){ dropped++; if(reasons.length<12) reasons.push(i+':'+why); continue; }
+                        if(w!==i) ptr.add(w*8).writePointer(e); w++;
+                    }
+                    if(dropped>0){
+                        if(logCount<80){
+                            flog('==== [COLLECTOR] class='+nameHash(cls)+' unk118 dropped='+dropped+' ['+reasons.join(',')+'] size '+size+'->'+w+' ====');
+                            dumpArr('  props@0x28        ', cls, 0x28);
+                            dumpPairs('  overriddenP@0x38 ', cls, 0x38);
+                            dumpArr('  unk118 (pre-fix)  ', cls, 0x118);
+                            logCount++;
+                        }
+                        out.add(0xc).writeU32(w);   // fix unk118 size before dce0 walks it
+                    }
+                }catch(e){ flog('[COLLECTOR] onLeave err '+e); }
+            }
+        });
+        // FUN_10219dfb4 @0x219dfb4 onEnter: belt-and-suspenders - compact unk118 (should already be clean). Do NOT
+        // touch list@0x128 (sparse-by-design; compacting it misaligns the parallel serialization structures).
+        Interceptor.attach(base.add(0x219dfb4), {
+            onEnter: function(a){
+                try{
+                    var cls = a[0];
+                    if(!looksLikeClass(cls)) return;
+                    var th = clsHashHex(cls);
+                    if(th && TARGETS[th] && logCount<80){ dumpFull('DFB4-ENTER', cls); logCount++; }
+                    var d1 = compact(cls, 0x118);
+                    if(d1>0 && logCount<160){ flog('[DFB4-BACKUP] class='+nameHash(cls)+' unk118 compacted='+d1); logCount++; }
+                }catch(e){ flog('[DFB4] onEnter err '+e); }
+            }
+        });
+        flog('[FINAL-DIAG] armed COLLECTOR(0x2197928) unk118 fix+dump + DFB4 backup-compact');
+        // NOTE: do NOT Interceptor.attach FUN_10219721c (CClass teardown) or any function that runs on the
+        // engine worker/redDispatcher threads - the macOS-27 frida-gum trampoline is broken on those threads
+        // (SIGBUS in the trampoline before onEnter runs; confirmed 2026-07-05). Bug #2 (worker-thread async
+        // teardown of a corrupt-listeners CClass) must be addressed on the MAIN thread (at the destroy-job
+        // enqueue / the listeners write) or in C++, never by hooking the worker-thread teardown itself.
+    } catch(e){ flog('[FINAL-DIAG] install err '+e); }
 })();
