@@ -2143,7 +2143,10 @@ function g_detachFinalizeHooks() {
 (function installBindDiag(){
     function blog(s){ try{ var f=new File('/tmp/cp2077_bindfail.log','a'); f.write(s+'\n'); f.flush(); f.close(); }catch(e){} }
     try {
-        var on=false; try{ File.readAllText('/tmp/cp2077_bindfail'); on=true; }catch(e){}
+        // Gated on a SEPARATE flag now: this validator-hook approach OVER-REPORTS (null return != genuine miss;
+        // it lists IScriptable/Entity/... = the binder's failure cascade). Use installBindFormatterDiag below
+        // (the CString::Format hook) for the GENUINE unresolved-native names.
+        var on=false; try{ File.readAllText('/tmp/cp2077_bindfail_validators'); on=true; }catch(e){}
         if(!on) return;
         var base = getModuleBase();
         var cnameGet = new NativeFunction(base.add(0x3452bdc), 'pointer', ['uint64']);
@@ -2168,6 +2171,40 @@ function g_detachFinalizeHooks() {
         }); } catch(e){ blog('[BIND-DIAG] attach err unres-type '+e); }
         blog('[BIND-DIAG] armed ' + (kinds.length+1) + ' validator hooks');
     } catch(e){ blog('[BIND-DIAG] install err ' + e); }
+})();
+
+// BIND FORMATTER DIAGNOSTIC (Ghidra-verified 2026-07-05): the reds binder logs each genuine unresolved-native
+// error via CString::Format = FUN_10002dccc(out=x0, fmt=x1, ...args) (a vsnprintf wrapper). The validator-hook
+// diag above OVER-REPORTS (cascade); this captures ONLY the real errors by filtering the FORMAT string (x1) and
+// reading the substituted name (x2). Writes to /tmp/cp2077_bindfmt.log. Gated on /tmp/cp2077_bindfail.
+(function installBindFormatterDiag(){
+    function flog(s){ try{ var f=new File('/tmp/cp2077_bindfmt.log','a'); f.write(s+'\n'); f.flush(); f.close(); }catch(e){} }
+    try {
+        var on=false; try{ File.readAllText('/tmp/cp2077_bindfail'); on=true; }catch(e){}
+        if(!on) return;
+        var base = getModuleBase();
+        var KEYS = ['native','resolve','implement','not found','missing','unresolved','import','bind'];
+        var seen={}, count=0, armed=0;
+        Interceptor.attach(base.add(0x2dccc), {
+            onEnter: function(a){
+                try{
+                    var fmt=null; try{ fmt=a[1].readUtf8String(); }catch(e){ return; }
+                    if(!fmt) return;
+                    var low=fmt.toLowerCase(); var hit=false;
+                    for(var i=0;i<KEYS.length;i++){ if(low.indexOf(KEYS[i])>=0){ hit=true; break; } }
+                    if(!hit) return;
+                    // x2 = first vararg (the substituted name); try string, else hex.
+                    var a2='?'; try{ a2=a[2].readUtf8String(); }catch(e){ try{ a2='0x'+a[2].toString(16); }catch(x){} }
+                    var a3='';  try{ var s3=a[3].readUtf8String(); if(s3) a3=' arg3="'+s3+'"'; }catch(e){}
+                    var key=fmt+'|'+a2;
+                    if(seen[key]) return; seen[key]=1;
+                    if(count<400){ flog('[FMT] fmt="'+fmt+'" arg2="'+a2+'"'+a3); count++; }
+                }catch(e){}
+            }
+        });
+        armed=1;
+        flog('[BIND-FMT] armed CString::Format hook @0x2dccc (filters: '+KEYS.join(',')+')');
+    } catch(e){ flog('[BIND-FMT] install err '+e); }
 })();
 
 // Property-layout finalize fix+diagnostic (Ghidra-verified 2026-07-04). Per-class finalize wrapper FUN_10219e270:
