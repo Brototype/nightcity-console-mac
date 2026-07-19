@@ -2183,7 +2183,10 @@ function g_detachFinalizeHooks() {
         var on=false; try{ File.readAllText('/tmp/cp2077_bindfail'); on=true; }catch(e){}
         if(!on) return;
         var base = getModuleBase();
-        var KEYS = ['native','resolve','implement','not found','missing','unresolved','import','bind'];
+        // broadened 2026-07-06 to catch EVERY class-validator error verbatim (FUN_1021fc61c): base-class-different,
+        // not-marked-abstract, has-to-be-declared-as, property-type-mismatch, missing native member, etc.
+        var KEYS = ['native','import','bind','missing','unresolved','resolve',
+                    'base class','has to be declared','abstract','property','function','does not match','not native','marked as'];
         var seen={}, count=0, armed=0;
         Interceptor.attach(base.add(0x2dccc), {
             onEnter: function(a){
@@ -2205,6 +2208,153 @@ function g_detachFinalizeHooks() {
         armed=1;
         flog('[BIND-FMT] armed CString::Format hook @0x2dccc (filters: '+KEYS.join(',')+')');
     } catch(e){ flog('[BIND-FMT] install err '+e); }
+})();
+
+// BIND-REJECT DIAGNOSTIC (Ghidra-verified 2026-07-06): names EVERY script-definition the engine binder rejects,
+// in ONE launch. The per-item validation loop FUN_1021fbf90 (@0x1021fbf90) walks the parsed ScriptDefinition list
+// and dispatches each to a per-kind validator (0=typeref/1=class/3=enum/4=bitfield/5=func); every validator's
+// pass/fail (w0: 1=pass, 0=REJECT) converges at 0x1021fc0c0 where the loop accumulates failures:
+//     1021fc0c0  eor w8,w0,#0x1        <- HOOK HERE (onEnter): w0 = this item's result, x21 = this item
+//     1021fc0c4  add w23,w23,w8        <- w23 (failure count); any nonzero -> 'Validation failed for %u types'
+//     ...        -> FUN_1021fbf90 returns 0 -> FUN_103d9e494 hits FUN_103da2a34 -> SIGTRAP 0x3da2a60.
+// The item's CName is at [x21+8] (proven: kind-0 validator FUN_1021fc1a4 does GetType(*(CName*)(item+8)) then
+// resolves it via the engine reverse-lookup for its 'Missing native typeref %hs' error). x21 is callee-saved and
+// reloaded each iteration, so it still points at the just-validated item at 0x1021fc0c0. We hook the LOOP (which
+// RETURNS NORMALLY) with onEnter ONLY - NOT an onLeave on a validator (validators tail-call; onLeave on a
+// tail-calling fn is the macOS-27 gum hazard that corrupted the older installBindDiag). This runs on the MAIN
+// thread (synchronous baseEngineInit), so the gum trampoline is safe here. w0==0 uniquely isolates the FAILING
+// item, so unlike installBindDiag this does NOT over-report the cascade. The loop visits all items and w23 sums
+// ALL failures before the panic, so one launch enumerates the COMPLETE reject set. Gated on /tmp/cp2077_bindreject.
+(function installBindRejectDiag(){
+    var LOG='/tmp/cp2077_bindreject.log';
+    function wlog(s){ try{ var f=new File(LOG,'a'); f.write(s+'\n'); f.flush(); f.close(); }catch(e){} try{console.log('[BIND-REJECT] '+s);}catch(e){} }
+    try {
+        var on=false; try{ File.readAllText('/tmp/cp2077_bindreject'); on=true; }catch(e){}
+        if(!on) return;
+        try{ var f0=new File(LOG,'w'); f0.write('=== bind-reject count (RELIABLE) ===\n'); f0.close(); }catch(e){}
+        var base=getModuleBase();
+        // COUNT ONLY, from a SAFE post-loop instruction. Any frida hook INSIDE the loop (0x21fc00c..0x21fc0d0)
+        // corrupts an adjacent instruction on macOS-27 (EXC_BAD_INSTRUCTION @0x21fc0cc) - the stock-gum trampoline
+        // flaw. So do NOT touch the loop. Read the engine's own failure counter w23 at 0x1021fc0d8 (a plain 'adrp'
+        // on the failure path, executed ONCE after the loop when w23!=0). This is the TRUE reject count, uncorrupted.
+        var got=false;
+        Interceptor.attach(base.add(0x21fc0d8), {
+            onEnter: function(){
+                if(got) return; got=true;
+                try{ var w23 = parseInt(this.context.x23.toString()) >>> 0;
+                     wlog('ENGINE total bind-failure count (w23) = '+w23); }
+                catch(e){ wlog('w23 read err '+e); }
+            }
+        });
+        wlog('armed: w23-count @0x21fc0d8 (post-loop, no loop hook)');
+    } catch(e){ wlog('install err '+e); }
+})();
+
+// BIND-ERROR CAPTURE (2026-07-06): the DEFINITIVE reason each class fails. FUN_10223a748(param1, blob, collector=x2)
+// runs the validator loop and every validator reports errors via collector->vtable[2](collector, char* msg, len)
+// (seen in FUN_10223a748: (**(code**)(*param_3+0x10))(param_3,"Failed to load scripts",0x16)). We hook FUN_10223a748
+// (a FUNCTION ENTRY - safe, unlike a loop-instruction hook), resolve collector->vtable[2] at runtime, and attach a
+// logger to it. Each call logs the FULLY-FORMATTED error (class/member names substituted). Gated /tmp/cp2077_binderr.
+(function installBindErrorCapture(){
+    var LOG='/tmp/cp2077_binderr.log';
+    function elog(s){ try{ var f=new File(LOG,'a'); f.write(s+'\n'); f.flush(); f.close(); }catch(e){} }
+    try {
+        var on=false; try{ File.readAllText('/tmp/cp2077_binderr'); on=true; }catch(e){}
+        if(!on) return;
+        try{ var f0=new File(LOG,'w'); f0.write('=== bind error capture (collector->vtable[2]) ===\n'); f0.close(); }catch(e){}
+        var base=getModuleBase();
+        var hooked=false, count=0;
+        Interceptor.attach(base.add(0x223a748), {
+            onEnter: function(a){
+                try{
+                    if(hooked) return;
+                    var collector=a[2];
+                    if(!collector || collector.isNull()) return;
+                    var vtbl=collector.readPointer();
+                    hooked=true;
+                    // The collector object is shared across the whole script-init pipeline. Different stages
+                    // report through different vtable slots, with different arg positions for the message:
+                    //   slot 2 @0x10  validator per-type error       report(this, char* msg, int len)      msg=b[1]
+                    //   slot 3 @0x18  summary ("Binding failed for N") report(this, char* msg, int len)      msg=b[1]
+                    //   slot 4 @0x20  binder per-FUNCTION error       report(this, funcDef, char* msg, int) msg=b[2]
+                    // Hook all three so we capture BOTH the validation pass AND the later function-binding pass
+                    // (FUN_1021ea1b8: "Unresolved return/parameter/local type", "Failed to create function", etc).
+                    var m2=vtbl.add(0x10).readPointer();
+                    var m3=vtbl.add(0x18).readPointer();
+                    var m4=vtbl.add(0x20).readPointer();
+                    elog('[CAPTURE] collector v2@'+m2+' v3@'+m3+' v4@'+m4);
+                    Interceptor.attach(m2, { onEnter: function(b){ try{ var s=b[1].readUtf8String(); if(s&&count<4000){count++;elog('[validate] '+s);} }catch(e){} } });
+                    if(!m3.equals(m2)) Interceptor.attach(m3, { onEnter: function(b){ try{ var s=b[1].readUtf8String(); if(s&&count<4000){count++;elog('[summary]  '+s);} }catch(e){} } });
+                    if(!m4.equals(m2)&&!m4.equals(m3)) Interceptor.attach(m4, { onEnter: function(b){ try{ var s=b[2].readUtf8String(); if(s&&count<4000){count++;elog('[bind-fn]  '+s);} }catch(e){} } });
+                }catch(e){ elog('resolve err '+e); }
+            }
+        });
+        elog('[CAPTURE] armed on FUN_10223a748');
+    } catch(e){ elog('install err '+e); }
+})();
+
+// BIND-PATCH (2026-07-07): the 3-branch binder relaxation that lets the CORRECTED Codeware.Global.reds BIND.
+// The macOS kind-1 CLASS validator FUN_1021fc61c (imageBase+0x21fc61c) enforces 3 checks that engine
+// STRUCTS-WITH-A-PARENT and ABSTRACT STRUCTS provably cannot satisfy in redscript (a struct can't `extends`, can't
+// be `abstract`) - Windows accepts the same RTTI dump, macOS rejects it. We turn each offending conditional branch
+// into an UNCONDITIONAL `b` that skips ONLY that error; type-exists / property-type / member-name checks stay fully
+// ACTIVE (this is NOT "disable validation"). Applied as a byte patch via Memory.patchCode (NOT Interceptor - no gum
+// trampoline, safe on macOS-27) at gadget load, BEFORE baseEngineInit runs the binder. Gated /tmp/cp2077_bindpatch.
+// Each branch is GUARDED: its current 4 bytes must equal the known tbz/tbnz encoding or that patch is SKIPPED - so a
+// future game update that shifts these offsets can never corrupt the wrong instruction. Verified against Steam 2.3.1
+// build 5314028: (A) 0x21fc754 tbz w0,#0,0x1021fc7dc -> b 0x1021fc83c ; (B) 0x21fc98c tbz w8,#0,0x1021fc9f4 ->
+// b 0x1021fc9f4 ; (C) 0x21fcb80 tbnz w0,#0,0x1021fcc14 -> b 0x1021fcc14. b = 0x14000000 | ((tgt-pc)>>2).
+(function installBindPatch(){
+    var LOG='/tmp/cp2077_bindpatch.log';
+    function plog(s){ try{ var f=new File(LOG,'a'); f.write(s+'\n'); f.flush(); f.close(); }catch(e){} try{console.log('[BIND-PATCH] '+s);}catch(e){} }
+    try {
+        var on=false; try{ File.readAllText('/tmp/cp2077_bindpatch'); on=true; }catch(e){}
+        if(!on) return;
+        try{ var f0=new File(LOG,'w'); f0.write('=== bind patch (6-branch validator relaxation) ===\n'); f0.close(); }catch(e){}
+        var base=getModuleBase();
+        if(!base){ plog('ERROR: no module base'); return; }
+        // [ file-off, expected CURRENT word (LE U32), NEW branch word (LE U32), label ]
+        // A/B/C = the class-KIND checks (struct/abstract/base-not-declared) redscript can't express.
+        // D/E/F = the per-member checks that were MASKED by A's early-out and only surface once A passes:
+        //   D base-diff   ("declared base class X that is different than current one Y", str 0x106cc4fc5) ->
+        //                 ISerializable (reds/redscript model says base IScriptable; macOS engine has it as a
+        //                 root, base <none>). Guard = the cmp of declared-vs-engine base at 0x21fcb18; b.eq
+        //                 0x1021fcc14 -> b (always take the "match" path, skip error + fail-flag). NOTE: an
+        //                 earlier build mis-patched 0x21fca08 which guards a DIFFERENT string 0x106cc4f50
+        //                 ("...that is not imported") - that never fired; 0x21fcb1c is the correct guard.
+        //   E proptype    ("Imported property type does not match") -> Windows-lenient resource-ref/enum types
+        //                 (ResourceRef vs rRef:CMesh etc, layout-identical); tbnz w0,#0,0x1021fcc9c -> b (same tgt).
+        //   F miss-func   ("Missing native function") -> Codeware @addMethod natives the macOS dylib doesn't
+        //                 register yet; cbz x0,<errEmit> RETARGETED to the loop-continue 0x1021fcdf0 so a
+        //                 not-found func is skipped instead of rejected. NOTE: the ~6 that Codeware actually CALLS
+        //                 (FromNumber/AttachController/GetEntries/GetAction/GetScale) are then declared-but-unbacked
+        //                 -> harmless at boot/menu (no content mod exercises them); durable fix = register in dylib.
+        var patches=[
+            [0x21fc754, 0x36000440, 0x1400003a, 'A struct-check   tbz w0,#0 -> b 0x1021fc83c'],
+            [0x21fc98c, 0x36000348, 0x1400001a, 'B abstract-check tbz w8,#0 -> b 0x1021fc9f4'],
+            [0x21fcb80, 0x370004a0, 0x14000025, 'C base-notdecl   tbnz w0,#0 -> b 0x1021fcc14'],
+            [0x21fcb1c, 0x540007c0, 0x1400003e, 'D base-diff      b.eq 0x1021fcc14 -> b (skip different-than-current)'],
+            [0x21fcce0, 0x3707fde0, 0x17ffffef, 'E proptype       tbnz w0,#0 -> b 0x1021fcc9c'],
+            [0x21fce20, 0xb4fffb20, 0xb4fffe80, 'F miss-func      cbz x0 -> loop-continue 0x1021fcdf0'],
+        ];
+        var applied=0;
+        patches.forEach(function(p){
+            var off=p[0], want=p[1]>>>0, neu=p[2]>>>0, label=p[3];
+            try{
+                var addr=base.add(off);
+                var cur=addr.readU32()>>>0;
+                if(cur!==want){
+                    plog('SKIP '+label+' @0x'+off.toString(16)+': current=0x'+cur.toString(16)+' != expected=0x'+want.toString(16)+' (offset moved? NOT patching)');
+                    return;
+                }
+                Memory.patchCode(addr, 4, function(ptr){ ptr.writeU32(neu); });
+                var after=addr.readU32()>>>0;
+                if(after===neu){ applied++; plog('OK   '+label+' @0x'+off.toString(16)+': 0x'+want.toString(16)+' -> 0x'+neu.toString(16)); }
+                else { plog('FAIL '+label+' @0x'+off.toString(16)+': readback=0x'+after.toString(16)+' expected=0x'+neu.toString(16)); }
+            }catch(e){ plog('ERR  '+label+': '+e); }
+        });
+        plog('done: '+applied+'/6 branches patched');
+    } catch(e){ plog('install err '+e); }
 })();
 
 // Property-layout finalize fix+diagnostic (Ghidra-verified 2026-07-04). Per-class finalize wrapper FUN_10219e270:
@@ -2452,4 +2602,84 @@ function g_detachFinalizeHooks() {
         // teardown of a corrupt-listeners CClass) must be addressed on the MAIN thread (at the destroy-job
         // enqueue / the listeners write) or in C++, never by hooking the worker-thread teardown itself.
     } catch(e){ flog('[FINAL-DIAG] install err '+e); }
+})();
+
+// ===== VIRTUAL ATELIER SPAWN-PATH PROBE (2026-07-13) =====
+// Diagnostic tracing of the ink widget-library spawn chain around Codeware's WidgetSpawningService fix.
+// IMPORTANT OWNERSHIP RULE: the 4 spawn CORES (SpawnFromLocal 0x4965de0, SpawnFromExternal 0x4965ec0,
+// AsyncSpawnFromLocal 0x4965980, AsyncSpawnFromExternal 0x4965b38) are owned by RED4ext MANUAL INLINE
+// HOOKS (Codeware WidgetSpawningService, armed via RED4EXT_GUM_HOOK_OFFSETS) - a Frida attach there would
+// patch over the detour branch and destroy it. This probe therefore hooks ONLY the un-owned inner
+// functions, which still discriminate everything:
+//   ResolveExternalLibrary 0x4965c90  (x8=out lib-Handle* SRET, x0=registry, x1=pathHash; on miss *out=0, NO load, NO log)
+//        -> a NON-NULL resolve for a VA pathHash proves Codeware's InjectDependency worked (THE fix signal)
+//   InstantiateItem        0x4923164  (x8=out SRET, x0=itemEntry w/ CName@+0 - logs BOTH x0/x1 u64s defensively)
+//        -> fires once per successful item lookup (page spawns + every grid row)
+//   HasExternalLibrary     0x4966554  (arg map unverified; x1 logged with path labeling, w0 retval)
+// Codeware-side actions (injection, colon-retry) are logged by the plugin itself to its red4ext log.
+// x8 is NOT in Frida's args[] - read it via this.context.x8 in onEnter.
+// Item names are logged as raw u64 CName hashes.
+// Gated on /tmp/cp2077_vaspawn_probe (NOT in nctool Regen's flag-restore set - re-touch per boot).
+// Appends to /tmp/cp2077_vaspawn.log with ISO timestamps. Rate-capped: first 400 events per hook,
+// then 1-in-50 sampling, so SpawnFromLocal cannot flood the log or tank frame time on IO.
+(function installSpawnProbe(){
+    var LOG='/tmp/cp2077_vaspawn.log';
+    function ts(){ try{ return new Date().toISOString(); }catch(e){ return '?'; } }
+    function vlog(s){ try{ var f=new File(LOG,'a'); f.write(ts()+' '+s+'\n'); f.flush(); f.close(); }catch(e){} try{ console.log('[VASPAWN] '+s); }catch(e2){} }
+    try {
+        var on=false; try{ File.readAllText('/tmp/cp2077_vaspawn_probe'); on=true; }catch(e){}
+        if(!on) return;
+        var base; try{ base=getModuleBase(); }catch(e){ base=null; }
+        if(!base){ vlog('[VASPAWN] ERROR: no module base'); return; }
+        vlog('=== spawn probe session start (base '+base+') ===');
+        // Known widget-library resource pathHashes (VA + inkWidgets), labeled inline when they match.
+        // Keys = NativePointer.toString() form (0x-prefixed, lowercase, NO leading zeros).
+        var PATHS = {
+            '0x5a413ee04843c418': 'stores',
+            '0xce44de04cd1368a9': 'virtual_atelier',
+            '0xd6b2a2bceeee5160': 'buttonhints',
+            '0xae393b6200c959af': 'slots',
+            '0xe655e42677452363': 'va_slots',
+            '0xd673c2bbd086462':  'preview'
+        };
+        function pathLabel(p){ try{ var h=p.toString(); var l=PATHS[h]; return l?(h+'<'+l+'>'):h; }catch(e){ return '<e>'; } }
+        // Per-hook rate cap: log the first 400 events, then 1 in 50 (returns the event # to log, or 0 to skip).
+        var caps={};
+        function gate(key){ var c=caps[key]=(caps[key]||0)+1;
+            if(c===401) vlog('[CAP] '+key+' hit 400 events -> sampling 1-in-50 from here');
+            if(c<=400) return c;
+            return (c%50===0)?c:0; }
+        // Deref an out-Handle slot saved at onEnter (Handle ptr at +0).
+        function derefOut(p){ try{ if(!p||p.isNull()) return 'out=<null>'; var v=p.readPointer(); return v.isNull()?'=> NULL':('=> '+v); }catch(e){ return '=> <unreadable>'; } }
+        // Read a u64 at p+0 defensively (for itemEntry CName sniffing).
+        function u64at(p){ try{ if(p&&!p.isNull()) return '0x'+p.readU64().toString(16); }catch(e){} return '<unreadable>'; }
+        // --- ResolveExternalLibrary 0x4965c90 (x8=out SRET, x0=registry, x1=pathHash) ---
+        try {
+            Interceptor.attach(base.add(0x4965c90), {
+                onEnter: function(a){ this.n=gate('RESOLVE'); if(!this.n) return; this.out=this.context.x8; this.ph=pathLabel(a[1]); },
+                onLeave: function(){ if(!this.n) return; var d=derefOut(this.out); vlog('[RESOLVE #'+this.n+'] path='+this.ph+' '+d+(d==='=> NULL'?' (MISS: engine does NO load, NO log)':'')); }
+            });
+            vlog('hook OK ResolveExternalLibrary @+0x4965c90');
+        } catch(e){ vlog('[VASPAWN] hook FAIL ResolveExternalLibrary @+0x4965c90: '+e); }
+        // --- spawn CORES: NOT hooked (owned by Codeware's RED4ext manual inline hooks - see banner) ---
+        // --- InstantiateItem 0x4923164 (Ghidra-confirmed x8=out SRET, x0=itemEntry w/ CName u64 @ +0;
+        //     u64@x1 logged too as a cheap self-check) ---
+        try {
+            Interceptor.attach(base.add(0x4923164), {
+                onEnter: function(a){ this.n=gate('INST-ITEM'); if(!this.n) return; this.out=this.context.x8;
+                    this.e0=u64at(a[0]); this.e1=u64at(a[1]); },
+                onLeave: function(){ if(!this.n) return; vlog('[INST-ITEM #'+this.n+'] u64@x0='+this.e0+' u64@x1='+this.e1+' '+derefOut(this.out)); }
+            });
+            vlog('hook OK InstantiateItem @+0x4923164');
+        } catch(e){ vlog('[VASPAWN] hook FAIL InstantiateItem @+0x4923164: '+e); }
+        // --- HasExternalLibrary 0x4966554 ---
+        try {
+            Interceptor.attach(base.add(0x4966554), {
+                onEnter: function(a){ this.n=gate('HAS-EXT'); if(!this.n) return; this.a1=pathLabel(a[1]); this.a2=a[2].toString(); },
+                onLeave: function(r){ if(!this.n) return; vlog('[HAS-EXT #'+this.n+'] x1='+this.a1+' x2='+this.a2+' ret(w0)='+r.toString()); }
+            });
+            vlog('hook OK HasExternalLibrary @+0x4966554');
+        } catch(e){ vlog('[VASPAWN] hook FAIL HasExternalLibrary @+0x4966554: '+e); }
+        vlog('=== spawn probe armed ('+Object.keys(caps).length+' counters live at first event) ===');
+    } catch(e){ vlog('[VASPAWN] install err '+e); }
 })();
