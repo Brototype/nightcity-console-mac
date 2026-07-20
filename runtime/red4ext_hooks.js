@@ -2080,9 +2080,47 @@ function g_detachFinalizeHooks() {
                 if (useCodeware) { sym = 'codeware_registerNatives'; reg = findExport('Codeware', sym); }
                 else             { sym = 'cybermodman_registerNatives'; reg = findExport('ArchiveXL', sym); }
                 nlog('[NATREG] ' + sym + ' export = ' + reg);
-                if (!reg) { nlog('[NATREG] export NOT FOUND (' + (useCodeware ? 'Codeware.dylib loaded?' : 'ArchiveXL natives build?') + ')'); return; }
-                new NativeFunction(reg, 'void', [])();
-                nlog('[NATREG] called ' + sym);
+                if (reg) {
+                    new NativeFunction(reg, 'void', [])();
+                    nlog('[NATREG] called ' + sym);
+                } else {
+                    nlog('[NATREG] export NOT FOUND (' + (useCodeware ? 'Codeware.dylib loaded?' : 'ArchiveXL natives build?') + ')');
+                }
+
+                // TweakXL registers a DISJOINT set of types (TweakXL, TweakDBManager, TweakDBBatch,
+                // ScriptableTweak), so it does NOT hit the name overlap that forces Codeware and ArchiveXL to be
+                // mutually exclusive - it runs IN ADDITION rather than instead. Without it, TweakXL's shipped
+                // reds declare natives that never reach CRTTISystem and the script binder dies while building
+                // its own "Missing native function" message the moment any mod references TweakDBManager
+                // (first seen with Equipment EX). Runs after the primary export so core types land first, and
+                // is skipped with a log line on TweakXL builds that predate the export.
+                try {
+                    var txlReg = findExport('TweakXL', 'tweakxl_registerNatives');
+                    if (txlReg) {
+                        new NativeFunction(txlReg, 'void', [])();
+                        nlog('[NATREG] called tweakxl_registerNatives');
+                    } else {
+                        nlog('[NATREG] tweakxl_registerNatives NOT FOUND (old TweakXL build; its reds natives will not bind)');
+                    }
+                } catch (eT) { nlog('[NATREG] tweakxl_registerNatives ERROR ' + eT); }
+
+                // ArchiveXL's OWN reds-visible class (App::Facade -> "ArchiveXL", declared native by
+                // scripts/Facade.reds). This is NOT cybermodman_registerNatives: that one is the Codeware
+                // Tier-1 stub whose globals collide with real Codeware (hence the mutual exclusion above,
+                // which stays), and it registers no ArchiveXL type in either mode - so the binder reported
+                // "Missing native class 'ArchiveXL'" as soon as those reds were staged. This export is
+                // overlap-free by construction and runs additively. Skipped with a log line on older builds.
+                try {
+                    var axlReg = findExport('ArchiveXL', 'archivexl_registerNatives');
+                    if (axlReg) {
+                        new NativeFunction(axlReg, 'void', [])();
+                        nlog('[NATREG] called archivexl_registerNatives');
+                    } else {
+                        nlog('[NATREG] archivexl_registerNatives NOT FOUND (old ArchiveXL build; its reds natives will not bind)');
+                    }
+                } catch (eA) { nlog('[NATREG] archivexl_registerNatives ERROR ' + eA); }
+
+                if (!reg) return;
 
                 // ---- Bug #2 validation (Ghidra + workflow-verified 2026-07-05): the persistence-schema rebuild
                 // job (PersistencySystem::OnInitialize FUN_103fec750, enqueued LATER on THIS main thread, runs on
