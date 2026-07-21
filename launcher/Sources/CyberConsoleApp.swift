@@ -358,7 +358,15 @@ final class Model: ObservableObject {
         // Script mods (.reds) must be recompiled into the game's script cache before launch; the cache is
         // only read at game startup. A full scc compile is ~0.3s, so run it on every Play when scripts exist.
         let needCompile = hasScripts() && fm.isExecutableFile(atPath: sccGamePath)
-        if needRegen || needCompile {
+        // Plugin-shipped reds (TweakXL / ArchiveXL / Codeware Scripts/*.reds) declare those plugins' native
+        // classes and MUST be staged into r6/scripts before scc runs, or the compiled bundle simply omits them
+        // and every plugin-scripting mod fails to bind. This is a SEPARATE unconditional step on purpose:
+        // folding it into `regen` meant it only ran when /tmp/cp2077_xl_items.txt was missing - i.e. almost
+        // never within a session - so the plugin natives silently never reached the bundle. Same skip-logic
+        // trap the /tmp enable-flags hit below.
+        let canStagePlugins = nctoolPath() != nil
+        let sccReady = fm.isExecutableFile(atPath: sccGamePath)
+        if needRegen || needCompile || canStagePlugins {
             busy = true; progress = 0
             busyDetail = needRegen ? "Preparing mods…" : "Compiling scripts…"
             status = busyDetail
@@ -373,8 +381,12 @@ final class Model: ObservableObject {
                         }
                     }
                 }
+                if canStagePlugins {
+                    self.runNctoolStreaming(["stageplugins", self.gamePath]) { _ in }
+                }
                 var compileWarn: String? = nil
-                if needCompile {
+                // Re-check after staging: the freshly staged plugin reds may be the only scripts present.
+                if needCompile || (sccReady && self.hasScripts()) {
                     DispatchQueue.main.async { self.busyDetail = "Compiling scripts…" }
                     compileWarn = self.compileScripts()
                 }
