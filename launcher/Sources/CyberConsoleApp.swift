@@ -351,10 +351,19 @@ final class Model: ObservableObject {
         guard missing.isEmpty else { status = "Can't launch - missing: \(missing.joined(separator: ", ")). Try Install again."; return }
         guard ensureGameEntitlements() else { return }   // re-sign if a Steam verify/update reset it
 
-        // The mod handoffs live in /tmp, which macOS clears on reboot. If mods are installed but the handoff
-        // is gone, regenerate it before launch so the game auto-loads the mods on this boot. Within a session
-        // (handoff already present, kept fresh by install/remove) this is skipped.
-        let needRegen = nctoolPath() != nil && !mods.isEmpty && !fm.fileExists(atPath: "/tmp/cp2077_xl_items.txt")
+        // The mod handoffs live in /tmp, which macOS clears on reboot AND sweeps periodically (its tmp-reaper
+        // deletes files untouched for ~3 days, no reboot required). They must exist at launch or mods degrade
+        // silently: without cp2077_xl_loc.json every mod LocKey resolves blank, so e.g. Virtual Atelier renders
+        // its storefront with NO tab name and NO menu item labels and nothing appears in any log.
+        //
+        // 2026-08-01: this gate used to be `!mods.isEmpty && !exists(cp2077_xl_items.txt)`, which failed twice
+        // over. (1) `mods` is built from red4ext/nightcity/mods manifests, which can be empty while archives are
+        // deployed - so needRegen was permanently false and Play never restored anything. (2) it only probed
+        // ONE of the five handoffs, so a partial sweep went unnoticed. Regenerate whenever ANY handoff is
+        // missing, independent of the manifests. Regen is idempotent and cheap.
+        let handoffs = ["/tmp/cp2077_xl_items.txt", "/tmp/cp2077_xl_loc.json", "/tmp/cp2077_xl_paths.txt",
+                        "/tmp/cp2077_xl_names.txt", "/tmp/cp2077_xl_meshalias.txt"]
+        let needRegen = nctoolPath() != nil && handoffs.contains { !fm.fileExists(atPath: $0) }
         // Script mods (.reds) must be recompiled into the game's script cache before launch; the cache is
         // only read at game startup. A full scc compile is ~0.3s, so run it on every Play when scripts exist.
         let needCompile = hasScripts() && fm.isExecutableFile(atPath: sccGamePath)
