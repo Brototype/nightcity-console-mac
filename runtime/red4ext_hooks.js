@@ -2331,6 +2331,51 @@ function g_detachFinalizeHooks() {
     } catch(e){ elog('install err '+e); }
 })();
 
+// SVCINIT (2026-08-01): drive Codeware's ScriptableService lifecycle at the post-bind moment.
+// On Windows this is HookAfter<ScriptBundle::Destruct>; on macOS that dtor is INLINED into the bind driver
+// FUN_10223a748 (its surviving fragment 0x21f3460 sits in a never-taken branch), and inline-hooking the
+// loader 0x3d9a028 HANGS the game (proven twice). So: Frida onLeave on the bind driver - the exact same
+// "scripts just loaded and bound" moment - calling Codeware's codeware_initScriptableServices export.
+// Without this, NO ScriptableService is ever constructed on macOS, no OnLoad runs, and every mod built on
+// ScriptableService (and callbacks registered from OnLoad) silently does nothing.
+// Escape hatch: touch /tmp/cp2077_no_svcinit
+(function(){
+    // Self-contained logger: nlog/elog are function-scoped inside their own IIFEs and NOT visible here.
+    // Referencing them killed the whole script at gadget load (ReferenceError), which took the BIND-PATCH
+    // below down with it -> 3510 validation failures -> binder formatter crash. Never share loggers across
+    // these blocks.
+    function slog(s){ try{ var f=new File('/tmp/cp2077_redlib.log','a'); f.write(s+'\n'); f.flush(); f.close(); }catch(e){} }
+    try {
+        var off=false; try{ File.readAllText('/tmp/cp2077_no_svcinit'); off=true; }catch(e){}
+        if(off){ slog('[SVCINIT] disabled (/tmp/cp2077_no_svcinit)'); return; }
+        var base=getModuleBase();
+        var done=false;
+        // 0x223a748 = the script BIND DRIVER: validate + bind happen INSIDE it, so its onLeave is the
+        // earliest provably POST-BIND moment - scripted classes are in RTTI and their methods are bound.
+        // TIMING FACTS, each proven by a breadcrumb run (do not re-litigate):
+        //   - InitScripts (0x3d8c188) onLeave is PRE-BIND: the boot state machine calls LoadScripts+bind
+        //     AFTER InitScripts returns (crash stacks show LoadScripts under 0x3f20348/0x3d9dd30, not under
+        //     0x3d8c188), so GetClasses(ScriptableService) = 0 there.
+        //   - GetGlobalFunction("InitializeScripts;") answers NULL even post-bind on macOS, so the C++ side
+        //     treats that gate as ADVISORY (see ScriptingService.cpp) - do not rely on it firing.
+        Interceptor.attach(base.add(0x223a748), {
+            onLeave: function(ret){
+                if(done) return;
+                done=true;
+                try{
+                    var p=null;
+                    try{ p=Module.findExportByName('Codeware.dylib','codeware_initScriptableServices'); }catch(e){}
+                    if(!p){ try{ var mods=Process.enumerateModules(); for(var i=0;i<mods.length;i++){ var m=mods[i]; if((m.name||'').indexOf('Codeware')>=0){ p=m.findExportByName('codeware_initScriptableServices'); if(p) break; } } }catch(e){} }
+                    if(!p||p.isNull()){ slog('[SVCINIT] export not found - Codeware.dylib too old?'); return; }
+                    new NativeFunction(p,'void',[])();
+                    slog('[SVCINIT] scriptable-service container init dispatched (post-bind)');
+                }catch(e){ slog('[SVCINIT] err '+e); }
+            }
+        });
+        slog('[SVCINIT] armed on bind driver 0x223a748 (onLeave, post-bind)');
+    } catch(e){ slog('[SVCINIT] install err '+e); }
+})();
+
 // BIND-PATCH (2026-07-07): the 3-branch binder relaxation that lets the CORRECTED Codeware.Global.reds BIND.
 // The macOS kind-1 CLASS validator FUN_1021fc61c (imageBase+0x21fc61c) enforces 3 checks that engine
 // STRUCTS-WITH-A-PARENT and ABSTRACT STRUCTS provably cannot satisfy in redscript (a struct can't `extends`, can't
