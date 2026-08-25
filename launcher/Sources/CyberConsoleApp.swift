@@ -439,8 +439,15 @@ final class Model: ObservableObject {
         // these, every plugin hook (ArchiveXL garment fixes, Codeware's WidgetSpawningService = the
         // dynamic-widget render fix for Codeware UI mods) silently no-ops. Keep this offset list in sync
         // with <GAME>/launch_red4ext_dynamic.sh.
+        // THIS LIST IS AN ALLOWLIST AND ITS OMISSIONS ARE SILENT. An address that is missing here still
+        // returns success from HookBefore/HookAfter and logs nothing in the plugin - the red4ext log just
+        // says "registered at 0x... (gum inactive: no-op)" and the hook never fires. That is exactly how
+        // keyboard input stayed dead after inkSystem::ProcessCharacterEvent (0x4887524) was mapped and the
+        // service enabled: everything reported OK and no character ever arrived. When a correctly-mapped
+        // hook appears to do nothing, CHECK THIS LIST FIRST:
+        //   grep -o "registered at 0x[0-9a-f]*" <newest red4ext log>   -> those are the no-op'd ones.
         env["RED4EXT_GUM_HOOKS"] = "scoped"
-        env["RED4EXT_GUM_HOOK_OFFSETS"] = "0x1704194,0xcc0710,0xe189f4,0xe16e68,0xe173fc,0xcb12bc,0x370d924,0x3710004,0xae6660,0xae3840,0x4965de0,0x4965ec0,0x4965980,0x4965b38,0x3d9a028,0x49799b8,0x49b888c,0x49a3084,0x47cf584,0x2197aac"
+        env["RED4EXT_GUM_HOOK_OFFSETS"] = "0x1704194,0xcc0710,0xe189f4,0xe16e68,0xe173fc,0xcb12bc,0x370d924,0x3710004,0xae6660,0xae3840,0x4965de0,0x4965ec0,0x4965980,0x4965b38,0x3d9a028,0x49799b8,0x49b888c,0x49a3084,0x47cf584,0x2197aac,0x4887524,0x49bded0"
         env["RED4EXT_GUM_MANUAL_OFFSETS"] = "all"
         let p = Process()
         p.executableURL = URL(fileURLWithPath: binaryPath)
