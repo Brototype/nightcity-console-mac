@@ -23,10 +23,32 @@ SUBZIP="dist/_notarize.zip"     # temporary zip used only for the notarization u
 echo "==> building app (ad-hoc), then re-signing with Developer ID"
 ./launcher/build-app.sh
 
-# Sign every Mach-O inside-out with hardened runtime + secure timestamp (required for notarization).
-find "$APP/Contents/Resources" -name "*.dylib" -print0 | while IFS= read -r -d '' f; do
-  codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$f"
+# The bundled nctool is a self-contained .NET helper that JITs. Under hardened runtime CoreCLR SIGKILLs the
+# instant it writes executable memory unless these entitlements are present (validated locally: JIT + a full
+# Kraken rawrepack run clean with them). Entitlements apply to the apphost EXECUTABLE, not the dylibs.
+NCTOOL_ENTS="$(mktemp -t nctool-ents)"
+cat > "$NCTOOL_ENTS" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>com.apple.security.cs.allow-jit</key><true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+  <key>com.apple.security.cs.disable-library-validation</key><true/>
+</dict></plist>
+PLIST
+NCTOOL_EXE="$APP/Contents/Resources/nctool/nctool"
+
+# Sign every nested Mach-O inside-out with hardened runtime + secure timestamp (required for notarization).
+# This is ALL Mach-O, not just *.dylib: the nctool bundle also ships helper executables (createdump) and the
+# .NET runtime dylibs. The nctool apphost is skipped here and signed next, with the JIT entitlements.
+find "$APP/Contents/Resources" -type f | while IFS= read -r f; do
+  [ "$f" = "$NCTOOL_EXE" ] && continue
+  if file "$f" | grep -q "Mach-O"; then
+    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$f"
+  fi
 done
+codesign --force --options runtime --timestamp --entitlements "$NCTOOL_ENTS" --sign "$SIGN_IDENTITY" "$NCTOOL_EXE"
+rm -f "$NCTOOL_ENTS"
 codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
@@ -45,40 +67,18 @@ rm -f "$ZIP"
 # 2) .dmg with an /Applications shortcut + drag-here layout, then notarize + staple
 #    the dmg itself so the downloaded image also passes Gatekeeper offline.
 rm -f "$DMG"
-VOL="NightCity Console"; STAGE="build/dmg"; RWDMG="dist/_rw.dmg"; APPNAME="$(basename "$APP")"
+VOL="NightCity Console"; STAGE="build/dmg"; APPNAME="$(basename "$APP")"
+# Pre-clean any stale mounts left by an interrupted prior run (they pile up as "NightCity Console 1/2/..."
+# and make the old hdiutil convert fail with "Resource temporarily unavailable").
+for v in /Volumes/"$VOL"*; do [ -d "$v" ] && hdiutil detach "$v" -force >/dev/null 2>&1 || true; done
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 ditto "$APP" "$STAGE/$APPNAME"
-ln -s /Applications "$STAGE/Applications"            # the shortcut users drag into
-rm -f "$RWDMG"
-hdiutil create -volname "$VOL" -srcfolder "$STAGE" -fs HFS+ -format UDRW -ov "$RWDMG"
-MNT="/Volumes/$VOL"
-hdiutil attach "$RWDMG" -nobrowse -noverify -noautoopen >/dev/null
-# Lay the window out as icon view: app on the left, Applications on the right, so it's
-# obvious you copy the app over. Non-fatal if Finder automation is unavailable - the
-# Applications shortcut alone still conveys it.
-osascript <<EOF || echo "  (note: could not style dmg window; Applications shortcut is still present)"
-tell application "Finder"
-  tell disk "$VOL"
-    open
-    set current view of container window to icon view
-    set toolbar visible of container window to false
-    set statusbar visible of container window to false
-    set the bounds of container window to {200, 120, 760, 470}
-    set vopts to the icon view options of container window
-    set arrangement of vopts to not arranged
-    set icon size of vopts to 96
-    set text size of vopts to 12
-    set position of item "$APPNAME" of container window to {150, 200}
-    set position of item "Applications" of container window to {410, 200}
-    update without registering applications
-    delay 1
-    close
-  end tell
-end tell
-EOF
-sync; hdiutil detach "$MNT" >/dev/null || hdiutil detach "$MNT" -force >/dev/null
-hdiutil convert "$RWDMG" -format UDZO -o "$DMG" >/dev/null
-rm -f "$RWDMG"; rm -rf "$STAGE"
+ln -s /Applications "$STAGE/Applications"            # the drag-here shortcut
+# Create the compressed .dmg DIRECTLY from the staging folder - no attach/Finder-style/convert dance (that was
+# flaky on macOS 27's deprecated hdiutil and accumulated stale /Volumes mounts). Reliable; the Applications
+# shortcut conveys "drag the app here" (the fancy icon layout is dropped for a build that always succeeds).
+hdiutil create -volname "$VOL" -srcfolder "$STAGE" -format UDZO -ov "$DMG" >/dev/null
+rm -rf "$STAGE"
 xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
 xcrun stapler staple "$DMG"
 
