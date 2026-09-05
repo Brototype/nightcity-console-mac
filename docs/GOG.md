@@ -45,8 +45,10 @@ The integration with current upstream uses Frida Gadget and the overlay directly
 Steam's RED4ext loader, address library, plugin deployment, redscript compilation, and
 hardcoded hook allowlist are excluded from the GOG launch path. Advanced mod installation
 is therefore unavailable on GOG; existing Steam support is retained. The console/reset
-commands were play-tested on the earlier GOG branch; this rebased integration still needs
-a separate in-game smoke test before replacing a working installation.
+commands were play-tested on the earlier GOG branch. On 2026-09-05 the rebased build also
+passed an initial GOG smoke test on macOS 26.6.2: reinstall, launch, save load, player
+capture, `help` listing both reset commands, and `money 1` completing successfully.
+Steam regression testing and broader feature coverage remain outstanding.
 
 ## What differs from the Steam engine
 
