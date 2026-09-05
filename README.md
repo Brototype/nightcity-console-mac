@@ -93,11 +93,13 @@ Game.AddToInventory("Items.MaxDOSE", 5)    # CET-style line, also works
 
 ```bash
 git clone <this repo> && cd nightcity-console-mac
-./tools/fetch-deps.sh        # pulls FridaGadget + RED4ext into deps/ (copies from a local install if present)
+./tools/fetch-deps.sh        # checks deps/ and fills gaps from an existing console installation
 ./dev/launch.sh              # builds the overlay, stages the payload into your game, and launches it
 ```
 
-`dev/launch.sh` honors `CP2077_DIR` if your game is not at the default Steam path. The third-party runtime binaries (`RED4ext.dylib`, `FridaGadget.dylib`) are not committed (see `.gitignore`); they are fetched into `deps/` and bundled into the release `.dmg`.
+For a fresh checkout, first import the three runtime libraries (`RED4ext.dylib`, `FridaGadget.dylib`, and `TweakXL.dylib`) from the official release ZIP using `./tools/fetch-deps.sh --from-zip /path/to/NightCity-Console-for-Mac.zip`. See [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) for the exact release, checksums, and optional TweakXL limitations. The binaries are not committed (see `.gitignore`).
+
+`dev/launch.sh` honors `CP2077_DIR` if your game is not at the default Steam path and selects the Steam or GOG command engine automatically. The GUI also detects GOG installations; see [docs/GOG.md](docs/GOG.md) for setup.
 
 To build the signed, notarized app for distribution, run `tools/sign-notarize.sh` (needs an Apple Developer ID). It re-signs everything inside-out with a hardened runtime, notarizes the `.app` and the `.dmg` with `notarytool`, staples the tickets, and produces both a `.dmg` and a `.zip` in `dist/`.
 
