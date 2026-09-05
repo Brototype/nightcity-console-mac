@@ -7,7 +7,27 @@ infinite ammo, heal, teleport, time/slowmo, police toggle, facts, and vehicle su
 
 ## Using it on a GOG install
 
-Point the Frida gadget at the GOG script in `FridaGadget.config`:
+First populate `deps/` using the [dependency setup instructions](DEPENDENCIES.md).
+Build the GUI with `./launcher/build-app.sh`, then open `build/NightCity Console.app`.
+The launcher detects `/Applications/Cyberpunk 2077` automatically, or you can select another
+location with **Browse**. A previously selected game folder takes priority.
+
+Click **Install**, then **Play**. The launcher recognizes the GOG bundle ID or its GOG framework,
+installs both command engines, and writes a store-specific `FridaGadget.config`. It does not
+start Steam or pass `SteamAppId` to the GOG game. If macOS blocks installation or re-signing,
+use **Open Privacy Settings** to enable **App Management** for NightCity Console; game libraries
+on external drives may need **Full Disk Access** instead. After replacing an older launcher,
+click **Reinstall NightCity Console** while the game is closed, then launch again.
+
+For the developer workflow, run:
+
+```bash
+CP2077_DIR="/Applications/Cyberpunk 2077" ./dev/launch.sh
+```
+
+This builds, installs, and launches the console. The script selects the command engine by store
+and clears any inherited `SteamAppId` for GOG. The source config keeps the Steam default; neither
+launcher requires you to edit it manually. The installed GOG config looks like this:
 
 ```json
 {
@@ -20,6 +40,13 @@ Point the Frida gadget at the GOG script in `FridaGadget.config`:
 ```
 
 Everything else (IPC command file, catalog, overlay) works as on Steam.
+
+The integration with current upstream uses Frida Gadget and the overlay directly on GOG.
+Steam's RED4ext loader, address library, plugin deployment, redscript compilation, and
+hardcoded hook allowlist are excluded from the GOG launch path. Advanced mod installation
+is therefore unavailable on GOG; existing Steam support is retained. The console/reset
+commands were play-tested on the earlier GOG branch; this rebased integration still needs
+a separate in-game smoke test before replacing a working installation.
 
 ## What differs from the Steam engine
 
