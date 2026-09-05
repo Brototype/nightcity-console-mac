@@ -508,42 +508,42 @@ final class Model: ObservableObject {
 
     private func launchGame() {
         if gameStore == .steam {
-        ensureSteam()
-        // ALWAYS restore the macOS compatibility-layer enable-flags before launch. These live in /tmp and are
-        // purged by macOS's periodic tmp-reaper (files unaccessed for ~3 days) even without a reboot. `regen`
-        // recreates them, but it only runs when /tmp/cp2077_xl_items.txt is missing - so if the reaper purges
-        // the flags but leaves that file, Regen is skipped and the flags stay gone -> the class-validator
-        // relaxation (cp2077_bindpatch) is off -> the redscript binder rejects the graph -> SIGTRAP crash at
-        // load with no menu. Creating them unconditionally here is immune to the Regen-skip logic.
-        for flag in ["cp2077_codeware_real", "cp2077_bindpatch", "cp2077_bindreject",
-                     "cp2077_binderr", "cp2077_reglog"] {
-            FileManager.default.createFile(atPath: "/tmp/\(flag)", contents: nil)
-        }
-        // Garment-hook ownership: with the gum gate armed below, RED4ext's manual inline hooks own the
-        // garment functions - this flag tells the Frida gadget to step aside (same contract as
-        // launch_red4ext_dynamic.sh). Without it the gadget would double-hook the same addresses.
-        FileManager.default.createFile(atPath: "/tmp/cp2077_red4ext_owns_garment", contents: nil)
+            ensureSteam()
+            // ALWAYS restore the macOS compatibility-layer enable-flags before launch. These live in /tmp and are
+            // purged by macOS's periodic tmp-reaper (files unaccessed for ~3 days) even without a reboot. `regen`
+            // recreates them, but it only runs when /tmp/cp2077_xl_items.txt is missing - so if the reaper purges
+            // the flags but leaves that file, Regen is skipped and the flags stay gone -> the class-validator
+            // relaxation (cp2077_bindpatch) is off -> the redscript binder rejects the graph -> SIGTRAP crash at
+            // load with no menu. Creating them unconditionally here is immune to the Regen-skip logic.
+            for flag in ["cp2077_codeware_real", "cp2077_bindpatch", "cp2077_bindreject",
+                         "cp2077_binderr", "cp2077_reglog"] {
+                FileManager.default.createFile(atPath: "/tmp/\(flag)", contents: nil)
+            }
+            // Garment-hook ownership: with the gum gate armed below, RED4ext's manual inline hooks own the
+            // garment functions - this flag tells the Frida gadget to step aside (same contract as
+            // launch_red4ext_dynamic.sh). Without it the gadget would double-hook the same addresses.
+            FileManager.default.createFile(atPath: "/tmp/cp2077_red4ext_owns_garment", contents: nil)
         }
         let inject = injectDylibs.map { "\(red4Dir)/\($0)" }.joined(separator: ":")
         var env = ProcessInfo.processInfo.environment
         env["DYLD_INSERT_LIBRARIES"] = inject
         env["DYLD_FORCE_FLAT_NAMESPACE"] = "1"
         if gameStore == .steam {
-        env["SteamAppId"] = "1091500"
-        // Arm the RED4ext loader's hooking gate (manual inline hooks for simple-prologue targets). Without
-        // these, every plugin hook (ArchiveXL garment fixes, Codeware's WidgetSpawningService = the
-        // dynamic-widget render fix for Codeware UI mods) silently no-ops. Keep this offset list in sync
-        // with <GAME>/launch_red4ext_dynamic.sh.
-        // THIS LIST IS AN ALLOWLIST AND ITS OMISSIONS ARE SILENT. An address that is missing here still
-        // returns success from HookBefore/HookAfter and logs nothing in the plugin - the red4ext log just
-        // says "registered at 0x... (gum inactive: no-op)" and the hook never fires. That is exactly how
-        // keyboard input stayed dead after inkSystem::ProcessCharacterEvent (0x4887524) was mapped and the
-        // service enabled: everything reported OK and no character ever arrived. When a correctly-mapped
-        // hook appears to do nothing, CHECK THIS LIST FIRST:
-        //   grep -o "registered at 0x[0-9a-f]*" <newest red4ext log>   -> those are the no-op'd ones.
-        env["RED4EXT_GUM_HOOKS"] = "scoped"
-        env["RED4EXT_GUM_HOOK_OFFSETS"] = "0x1704194,0xcc0710,0xe189f4,0xe16e68,0xe173fc,0xcb12bc,0x370d924,0x3710004,0xae6660,0xae3840,0x4965de0,0x4965ec0,0x4965980,0x4965b38,0x3d9a028,0x49799b8,0x49b888c,0x49a3084,0x47cf584,0x2197aac,0x4887524,0x49bded0"
-        env["RED4EXT_GUM_MANUAL_OFFSETS"] = "all"
+            env["SteamAppId"] = "1091500"
+            // Arm the RED4ext loader's hooking gate (manual inline hooks for simple-prologue targets). Without
+            // these, every plugin hook (ArchiveXL garment fixes, Codeware's WidgetSpawningService = the
+            // dynamic-widget render fix for Codeware UI mods) silently no-ops. Keep this offset list in sync
+            // with <GAME>/launch_red4ext_dynamic.sh.
+            // THIS LIST IS AN ALLOWLIST AND ITS OMISSIONS ARE SILENT. An address that is missing here still
+            // returns success from HookBefore/HookAfter and logs nothing in the plugin - the red4ext log just
+            // says "registered at 0x... (gum inactive: no-op)" and the hook never fires. That is exactly how
+            // keyboard input stayed dead after inkSystem::ProcessCharacterEvent (0x4887524) was mapped and the
+            // service enabled: everything reported OK and no character ever arrived. When a correctly-mapped
+            // hook appears to do nothing, CHECK THIS LIST FIRST:
+            //   grep -o "registered at 0x[0-9a-f]*" <newest red4ext log>   -> those are the no-op'd ones.
+            env["RED4EXT_GUM_HOOKS"] = "scoped"
+            env["RED4EXT_GUM_HOOK_OFFSETS"] = "0x1704194,0xcc0710,0xe189f4,0xe16e68,0xe173fc,0xcb12bc,0x370d924,0x3710004,0xae6660,0xae3840,0x4965de0,0x4965ec0,0x4965980,0x4965b38,0x3d9a028,0x49799b8,0x49b888c,0x49a3084,0x47cf584,0x2197aac,0x4887524,0x49bded0"
+            env["RED4EXT_GUM_MANUAL_OFFSETS"] = "all"
         } else {
             env.removeValue(forKey: "SteamAppId")
             // These offsets target the Steam executable; never inherit them into the GOG build.
@@ -863,13 +863,13 @@ struct ContentView: View {
 
             Divider()
             if m.gameStore == .steam {
-            HStack {
-                Text("MODS").font(.caption2).foregroundColor(.secondary)
-                Spacer()
-                Button("Add Mod…") { addMod() }.disabled(!m.installed || m.busy)
-            }
-            modDropZone
-            modsList
+                HStack {
+                    Text("MODS").font(.caption2).foregroundColor(.secondary)
+                    Spacer()
+                    Button("Add Mod…") { addMod() }.disabled(!m.installed || m.busy)
+                }
+                modDropZone
+                modsList
             } else if gogBuild {
                 Text("GOG supports the console and item browser. Advanced mod loading is not ported yet.")
                     .font(.callout).foregroundColor(.secondary)
